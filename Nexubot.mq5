@@ -103,6 +103,7 @@ input ulong           InpMagicNumber       = 20260611; // EA magic number (uniqu
 //  SECTION 2: CONSTANTS
 //  Internal fixed values. Not user-editable but documented for transparency.
 //==========================================================================
+
 #define MAX_ZONES        100     // Hard cap for each POI array (FVG/IFVG/OB)
 #define MAX_PIVOTS       50      // Max pivot points to scan in structure detection
 #define MAX_TRADE_STATES 5       // Max concurrent tracked positions (per symbol EA = 1)
@@ -147,6 +148,7 @@ input ulong           InpMagicNumber       = 20260611; // EA magic number (uniqu
 //  SECTION 3: STRUCT DEFINITIONS
 //  All data containers used across the EA.
 //==========================================================================
+
 /// @brief Represents a single Point of Interest (FVG, IFVG, or Order Block).
 struct SZone {
     bool   active;          // Is this zone still valid (not expired)?
@@ -214,6 +216,7 @@ struct SSessionInfo {
 //  SECTION 4: GLOBAL STATE VARIABLES
 //  All mutable runtime state. Only modified within specific functions.
 //==========================================================================
+
 //--- Trading engine objects
 CTrade g_trade;
 CPositionInfo g_position_info;
@@ -250,6 +253,9 @@ SPositionState g_pos_state;
 //--- Bar timing — used to detect when a new M5 bar has formed
 datetime g_last_bar_time = 0;
 
+//--- State tracking for log throttling
+string g_last_skip_reason = "";
+
 //--- Cooldown / throttle
 datetime g_last_signal_time = 0;
 int g_bars_since_last_signal = 0;
@@ -265,6 +271,7 @@ string g_volatile_ids[] = {"XAU", "XAG", "BTC", "ETH", "US30", "NAS", "SPX", "UK
 //==========================================================================
 //  SECTION 5: UTILITY & TECHNICAL ANALYSIS HELPERS
 //==========================================================================
+
 /// @brief Returns the current ATR value from the last confirmed (closed) bar.
 /// @return ATR value, floored at MIN_ATR_FLOOR to prevent division by zero.
 double GetATR() {
@@ -274,12 +281,11 @@ double GetATR() {
     ArraySetAsSeries(buf, true);
 
     ResetLastError();
-
     int copied = CopyBuffer(g_h_atr, 0, 1, 1, buf);
 
     if (copied < 1) {
-         PrintFormat("ATR CopyBuffer failed. Error=%d", GetLastError());
-         return 0.0;
+        PrintFormat("ATR CopyBuffer failed. Error=%d", GetLastError());
+        return 0.0;
     };
 
     return buf[0];
@@ -290,11 +296,15 @@ double GetATR() {
 /// @return Expansion ratio, clipped to [0.3, 3.0] to bound outliers.
 double GetATRExpansionRatio() {
     if (g_h_atr == INVALID_HANDLE || g_h_atr_ema == INVALID_HANDLE) return 1.0;
+
     double atr_buf[], ema_buf[];
+
     ArraySetAsSeries(atr_buf, true);
     ArraySetAsSeries(ema_buf, true);
+
     if (CopyBuffer(g_h_atr, 0, 1, 1, atr_buf) < 1) return 1.0;
     if (CopyBuffer(g_h_atr_ema, 0, 1, 1, ema_buf) < 1 || ema_buf[0] <= 0) return 1.0;
+
     double ratio = atr_buf[0] / ema_buf[0];
     return MathMax(0.3, MathMin(3.0, ratio));
 }
@@ -303,8 +313,7 @@ double GetATRExpansionRatio() {
 /// @return 1.0 = bullish, -1.0 = bearish, 0.0 = flat/neutral.
 double GetHTFTrend() {
     if (g_h_ema50_h1 == INVALID_HANDLE || g_h_ema200_h1 == INVALID_HANDLE) {
-         Print("HTF handles invalid");
-         return 0.0;
+        return 0.0;
     };
 
     double ema50[], ema200[];
@@ -316,10 +325,6 @@ double GetHTFTrend() {
 
     int copied50 = CopyBuffer(g_h_ema50_h1, 0, 1, 1, ema50);
     int copied200 = CopyBuffer(g_h_ema200_h1, 0, 1, 1, ema200);
-
-    PrintFormat("EMA50 copied=%d EMA200 copied=%d",
-               copied50,
-               copied200);
 
     // Use index 1 (last confirmed H1 bar) to avoid repainting on current bar
     if (copied50  < 1) return 0.0;
@@ -336,18 +341,23 @@ double GetHTFTrend() {
 /// @return VWAP price, or the last close if volume data is unavailable.
 double CalculateVWAP(const MqlRates &rates[], int total) {
     if (total < 1) return rates[0].close;
+
     double cum_pv = 0.0, cum_vol = 0.0;
     MqlDateTime dt0;
     TimeToStruct(rates[0].time, dt0); // Reference: today's date
+
     for (int i = 0; i < total; i++) {
         MqlDateTime dti;
         TimeToStruct(rates[i].time, dti);
+
         // Stop when we cross into the previous day
-        if (dti.day != dt0.day || dti.mon != dt0.mon) break;
+        if (dti.day != dt0.day || dti.mon != dt0.mon) break;\
+
         double typical = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
         cum_pv += typical * (double)rates[i].tick_volume;
         cum_vol += (double)rates[i].tick_volume;
     }
+
     return (cum_vol > 0.0) ? (cum_pv / cum_vol) : rates[0].close;
 }
 
@@ -359,8 +369,10 @@ double CalculateVWAP(const MqlRates &rates[], int total) {
 double GetVolumeSMA(const MqlRates &rates[], int start, int period) {
     int total = ArraySize(rates);
     if (total < start + period) return 1.0;
+
     double sum = 0.0;
     for (int i = start; i < start + period; i++) sum += (double)rates[i].tick_volume;
+
     return MathMax(1.0, sum / period);
 }
 
@@ -377,9 +389,11 @@ bool IsHighVolatility(const string symbol) {
     string sym_upper = symbol;
     StringToUpper(sym_upper);
     int n = ArraySize(g_volatile_ids);
+
     for (int i = 0; i < n; i++) {
         if (StringFind(sym_upper, g_volatile_ids[i]) >= 0) return true;
     }
+
     return false;
 }
 
@@ -387,8 +401,18 @@ bool IsHighVolatility(const string symbol) {
 /// Returns true (acceptable) when InpMaxSpreadPoints = 0 (filter disabled).
 bool IsSpreadAcceptable() {
     if (InpMaxSpreadPoints <= 0) return true;
+
     long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-    return spread <= (long)InpMaxSpreadPoints;
+    long max_spread = (long)InpMaxSpreadPoints;
+
+    // XAU, BTC, and Indices naturally have much wider point spreads.
+    // If the asset is volatile, we scale the max allowed spread up by 10x
+    // to prevent the strategy tester from skipping valid bars indefinitely.
+    if (IsHighVolatility(_Symbol)) {
+        max_spread *= 10;
+    }
+
+    return spread <= max_spread;
 }
 
 /// @brief Logs a message to the Experts log. Prepends EA identifier.
@@ -401,17 +425,20 @@ void Log(const string msg, bool verbose_only = false) {
 //  SECTION 6: DAILY LEVELS & ASIAN RANGE
 //  These form the backbone of Tier-3 sweep detection (highest quality).
 //==========================================================================
+
 /// @brief Fetches previous day's High (PDH) and Low (PDL) from D1 data.
 /// @param pdh  Output: Previous Day High.
 /// @param pdl  Output: Previous Day Low.
 void GetDailyLevels(double &pdh, double &pdl) {
     MqlRates d1[];
     ArraySetAsSeries(d1, true);
+
     // Index 0 = today (forming), Index 1 = yesterday (confirmed)
     if (CopyRates(_Symbol, PERIOD_D1, 0, 3, d1) < 2) {
         pdh = 0.0; pdl = 0.0;
         return;
     }
+
     pdh = d1[1].high;
     pdl = d1[1].low;
 }
@@ -426,8 +453,10 @@ void GetAsianRange(double &asian_high, double &asian_low) {
     ArraySetAsSeries(rates, true);
     // ~16 hours of M5 bars = 192 bars (enough to cover from Asia to current)
     int copied = CopyRates(_Symbol, PERIOD_M5, 0, 250, rates);
+
     asian_high = 0.0;
     asian_low = DBL_MAX;
+
     if (copied < 1) { asian_low = 0.0; return; }
 
     MqlDateTime today_dt;
@@ -436,14 +465,17 @@ void GetAsianRange(double &asian_high, double &asian_low) {
     for (int i = 0; i < copied; i++) {
         MqlDateTime bar_dt;
         TimeToStruct(rates[i].time, bar_dt);
+
         // Stop scanning when we cross into the previous day
         if (bar_dt.day != today_dt.day || bar_dt.mon != today_dt.mon) break;
+
         // Only accumulate bars within the Asian session window
         if (bar_dt.hour >= InpAsianStart && bar_dt.hour < InpAsianEnd) {
             asian_high = MathMax(asian_high, rates[i].high);
             asian_low = MathMin(asian_low,  rates[i].low);
         }
     }
+
     // If no Asian bars found today (pre-Asian session), use safe defaults
     if (asian_low == DBL_MAX) { asian_high = 0.0; asian_low = 0.0; }
 }
@@ -452,8 +484,10 @@ void GetAsianRange(double &asian_high, double &asian_low) {
 double GetRecentLow(const MqlRates &rates[], int start, int n_bars) {
     int total = ArraySize(rates);
     double lo = DBL_MAX;
+
     for (int i = start; i < MathMin(start + n_bars, total); i++)
         lo = MathMin(lo, rates[i].low);
+
     return (lo == DBL_MAX) ? 0.0 : lo;
 }
 
@@ -473,29 +507,36 @@ double GetRecentHigh(const MqlRates &rates[], int start, int n_bars) {
 //  Index 0 = newest bar. A pivot at index k requires k+lookback bars
 //  to the left (older) AND k-lookback bars to the right (newer) to exist.
 //==========================================================================
+
 /// @brief Returns true if rates[idx].high is the highest within the lookback window.
 /// Only processes CONFIRMED pivots — will not fire on recent unconfirmed bars.
 bool IsPivotHigh(const MqlRates &rates[], int idx, int lookback) {
     int total = ArraySize(rates);
+
     // Need lookback bars on both sides (newer = lower idx, older = higher idx)
     if (idx - lookback < 0 || idx + lookback >= total) return false;
     double h = rates[idx].high;
+
     for (int i = 1; i <= lookback; i++) {
         if (rates[idx - i].high >= h) return false; // Newer bar has higher high
         if (rates[idx + i].high >= h) return false; // Older bar has higher high
     }
+
     return true;
 }
 
 /// @brief Returns true if rates[idx].low is the lowest within the lookback window.
 bool IsPivotLow(const MqlRates &rates[], int idx, int lookback) {
     int total = ArraySize(rates);
+
     if (idx - lookback < 0 || idx + lookback >= total) return false;
     double lo = rates[idx].low;
+
     for (int i = 1; i <= lookback; i++) {
         if (rates[idx - i].low <= lo) return false;
         if (rates[idx + i].low <= lo) return false;
     }
+
     return true;
 }
 
@@ -504,6 +545,7 @@ bool IsPivotLow(const MqlRates &rates[], int idx, int lookback) {
 //  Uses confirmed pivot highs/lows from the last InpStructureLookback bars.
 //  All structural breaks are assessed on candle CLOSE (no wick triggers).
 //==========================================================================
+
 /// @brief Detects current market structure, BOS, CHoCH, and Premium/Discount position
 /// using the last N confirmed M5 bars.
 /// @param rates M5 rates array in series order (0=newest).
@@ -533,7 +575,7 @@ SStructureInfo DetectStructure(const MqlRates &rates[], int total) {
 
     // ph[0]=most recent pivot high, ph[1]=second most recent, etc.
     double last_high = ph[0], prev_high = ph[1];
-    double last_low  = pl[0], prev_low  = pl[1];
+    double last_low = pl[0], prev_low = pl[1];
 
     result.last_high = last_high;
     result.last_low = last_low;
@@ -581,6 +623,7 @@ SStructureInfo DetectStructure(const MqlRates &rates[], int total) {
 //  Tier 2: 50-period major swings or round-number proximity
 //  Tier 1: Internal structural pivots (lowest quality, often filtered out)
 //==========================================================================
+
 /// @brief Checks if the close price is near a psychological round-number level.
 /// Uses a magnitude-based step to determine what "round" means for the asset.
 /// @param close_price Current price.
@@ -593,12 +636,15 @@ bool IsRoundNumberSweep(double close_price, double recent_high, double recent_lo
     //                           price 12345.6 → magnitude=10000, step=1000
     double magnitude = MathPow(10.0, MathFloor(MathLog10(close_price)));
     double step = magnitude / 10.0;
+
     if (magnitude <= 10) step = 1.0;
+
     double closest_round = MathRound(close_price / step) * step;
     double dist_to_round = MathMin(
         MathAbs(recent_high - closest_round),
         MathAbs(recent_low  - closest_round)
     );
+
     return dist_to_round < (atr * 0.5);
 }
 
@@ -699,18 +745,21 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
 //  Incremental update system: processes new zones from the latest bar triplet
 //  and ages/mitigates existing zones on every new bar.
 //==========================================================================
+
 /// @brief Compacts a zone array by removing all inactive zones and
 /// shifting active ones to the front. Resets the count.
 /// @param zones The zone array to compact.
 /// @param count [In/Out] The current active count.
 void CompactZoneArray(SZone &zones[], int &count) {
     int new_count = 0;
+
     for (int i = 0; i < count; i++) {
         if (zones[i].active) {
             if (new_count != i) zones[new_count] = zones[i];
             new_count++;
         }
     }
+
     count = new_count;
 }
 
@@ -1021,6 +1070,7 @@ double GetNearestOpposingPOI(int direction, double entry) {
 //==========================================================================
 //  SECTION 11: SESSION MANAGEMENT
 //==========================================================================
+
 /// @brief Returns the current session context based on server time.
 SSessionInfo GetSessionInfo() {
     SSessionInfo info;
@@ -1063,6 +1113,7 @@ SSessionInfo GetSessionInfo() {
 //  Each function implements one strategy and returns an SSignal.
 //  All strategies follow the same return contract: signal.valid = true/false.
 //==========================================================================
+
 /// @brief STRATEGY 1: Liquidity Sweep with BOS confirmation.
 /// Highest quality setup. Requires a Tier-2+ sweep AND a structural break
 /// to have BOTH occurred within their respective recency windows
@@ -1075,8 +1126,6 @@ SSessionInfo GetSessionInfo() {
 /// @param atr Current ATR.
 SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
-
-    Print("Testing Liquidity Sweep");
 
     // Require a Tier2+ sweep within the recency window
     if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
@@ -1119,8 +1168,6 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
 /// @param atr Current ATR.
 SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
-
-    Print("Testing ICT OTE");
 
     if (!g_structure.valid) return sig;
     if (g_structure.last_high <= 0 || g_structure.last_low <= 0) return sig;
@@ -1177,8 +1224,6 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
 SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
-    Print("Testing IFVG");
-
     double close_price = curr.close;
     bool bouncing_up = close_price > curr.open;
     bool bouncing_down = close_price < curr.open;
@@ -1234,8 +1279,6 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
 /// @param sweep_tier Current sweep tier.
 SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
-
-    Print("Testing POI Reversal");
 
     // Only after a significant sweep occurred recently (not necessarily this bar)
     if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
@@ -1325,15 +1368,13 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
 
 /// @brief STRATEGY 5: VWAP Bounce.
 /// Institutional volume-backed bounce off the session VWAP. Requires:
-///   - Price touch and close on correct side of VWAP
-///   - Volume above average (institutional displacement)
-///   - A Tier 2+ sweep already completed (avoid counter-trend traps)
-/// @param curr       Last confirmed bar.
-/// @param atr        Current ATR.
+/// - Price touch and close on correct side of VWAP
+/// - Volume above average (institutional displacement)
+/// - A Tier 2+ sweep already completed (avoid counter-trend traps)
+/// @param curr Last confirmed bar.
+/// @param atr Current ATR.
 SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
-
-    Print("Testing VWAP Bounce");
 
     if (g_vwap <= 0 || g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
 
@@ -1436,11 +1477,12 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
 //  Deterministic rule-based scoring system replacing the Python ML model.
 //  Produces a 0-100 score reflecting the quality and alignment of the signal.
 //  This is SUPERIOR to the ML approach for achieving high win rates because:
-//    - No training data uncertainty
-//    - No overfitting to historical noise
-//    - Completely transparent and tunable
-//    - Deterministic (same input = same output)
+//  - No training data uncertainty
+//  - No overfitting to historical noise
+//  - Completely transparent and tunable
+//  - Deterministic (same input = same output)
 //==========================================================================
+
 /// @brief Calculates the composite confluence score for a given signal.
 /// Each component corresponds to an identifiable institutional condition.
 /// The weighted sum is normalized to a 0-100 scale.
@@ -1478,7 +1520,7 @@ int CalculateConfluenceScore(const SSignal &sig,
     if (g_structure.valid && g_bars_since_break <= InpBOSRecencyBars &&
         g_recent_break_dir != STRUCT_FLAT) {
         bool break_matches_dir = (dir == ZONE_BULL && g_recent_break_dir == STRUCT_BULL) ||
-                                  (dir == ZONE_BEAR && g_recent_break_dir == STRUCT_BEAR);
+                                 (dir == ZONE_BEAR && g_recent_break_dir == STRUCT_BEAR);
 
         if (break_matches_dir) score += SCORE_BOS_CONFIRMED;
         else score += SCORE_CHOCH_CONFIRMED;
@@ -1537,7 +1579,6 @@ int CalculateConfluenceScore(const SSignal &sig,
     return MathMax(0, MathMin(100, score));
 }
 
-
 //==========================================================================
 //  SECTION 14: RISK MANAGEMENT
 //==========================================================================
@@ -1546,16 +1587,20 @@ int CalculateConfluenceScore(const SSignal &sig,
 /// size and currency
 double GetRiskCap(double balance, string currency) {
     if (!InpUseDynamicRisk) return InpRiskPercent;
+
     bool is_zar = (StringFind(currency, "ZAR") >= 0);
+
     if (is_zar) {
         if (balance < 2000) return MathMin(InpRiskPercent, 5.0);
         if (balance < 10000) return MathMin(InpRiskPercent, 4.0);
         if (balance < 100000) return MathMin(InpRiskPercent, 3.0);
+
         return MathMin(InpRiskPercent, 2.0);
     } else {
         if (balance < 100) return MathMin(InpRiskPercent, 5.0);
         if (balance < 500) return MathMin(InpRiskPercent, 4.0);
         if (balance < 5000) return MathMin(InpRiskPercent, 3.0);
+
         return MathMin(InpRiskPercent, 2.0);
     }
 }
@@ -1565,8 +1610,11 @@ double GetRiskCap(double balance, string currency) {
 bool ValidateRiskReward(double entry, double sl, double tp, bool is_long) {
     double sl_dist = MathAbs(entry - sl);
     double tp_dist = MathAbs(tp - entry);
+
     if (sl_dist <= 0) return false;
+
     double rr = tp_dist / sl_dist;
+
     return rr >= InpMinRR;
 }
 
@@ -1682,6 +1730,7 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
 //==========================================================================
 //  SECTION 15: TRADE EXECUTION
 //==========================================================================
+
 /// @brief Executes a market order and populates the position state tracker.
 /// @param signal Validated, scored signal.
 /// @param sl Calculated stop loss price.
@@ -1764,7 +1813,7 @@ bool IsPositionOpen() {
 /// @return true if modification succeeded.
 bool ModifyStopLoss(double new_sl) {
     if (!PositionSelectByTicket(g_pos_state.ticket)) return false;
-    int digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
     double curr_sl = PositionGetDouble(POSITION_SL);
     double curr_tp = PositionGetDouble(POSITION_TP);
     new_sl = NormalizeDouble(new_sl, digits);
@@ -1783,10 +1832,10 @@ bool ModifyStopLoss(double new_sl) {
 
 /// @brief Core position management loop. Runs on every tick.
 /// Implements the staggered TP management plan:
-///   TP1 reached → Move SL to Breakeven + ATR buffer
-///   TP2 reached → Trail SL to TP1 (lock in partial profit)
-///   TP3 reached → Position closes automatically (fixed TP order)
-///   Timeout     → Log and allow position to continue (do not force close)
+/// TP1 reached → Move SL to Breakeven + ATR buffer
+/// TP2 reached → Trail SL to TP1 (lock in partial profit)
+/// TP3 reached → Position closes automatically (fixed TP order)
+/// Timeout → Log and allow position to continue (do not force close)
 void ManagePosition() {
     if (!IsPositionOpen()) {
         // Position was closed (TP, SL, or manual close) — reset state
@@ -1816,6 +1865,7 @@ void ManagePosition() {
     if (!g_pos_state.tp1_hit) {
         bool hit_tp1 = g_pos_state.is_long ? (curr_price >= g_pos_state.tp1)
                                             : (curr_price <= g_pos_state.tp1);
+
         if (hit_tp1) {
             g_pos_state.tp1_hit = true;
             // BE price = entry + ATR buffer (long) or entry - ATR buffer (short)
@@ -1840,6 +1890,7 @@ void ManagePosition() {
     if (g_pos_state.tp1_hit && !g_pos_state.tp2_hit) {
         bool hit_tp2 = g_pos_state.is_long ? (curr_price >= g_pos_state.tp2)
                                             : (curr_price <= g_pos_state.tp2);
+
         if (hit_tp2) {
             g_pos_state.tp2_hit = true;
             double trail_sl = NormalizeDouble(g_pos_state.tp1, digits);
@@ -1859,28 +1910,6 @@ void ManagePosition() {
 //  Orchestrates all subsystems when a new M5 bar is confirmed.
 //  This is the primary "brain" function — it decides whether to trade.
 //==========================================================================
-bool WaitForIndicatorsReady() {
-   const uint timeout_ms = 5000;
-   const uint start = GetTickCount();
-
-   while(GetTickCount() - start < timeout_ms) {
-      bool atr_ready =
-         BarsCalculated(g_h_atr) >= InpATRPeriod;
-
-      bool ema50_ready =
-         BarsCalculated(g_h_ema50_h1) >= 50;
-
-      bool ema200_ready =
-         BarsCalculated(g_h_ema200_h1) >= 200;
-
-      if(atr_ready && ema50_ready && ema200_ready)
-         return true;
-
-      Sleep(100);
-   }
-
-   return false;
-}
 
 /// @brief Full market analysis pipeline executed on each new M5 bar close.
 /// Follows the strict 5-condition funnel before generating any signal.
@@ -1888,21 +1917,35 @@ void RunMarketAnalysis() {
     // ---- Guard: Session filter ----
     SSessionInfo session = GetSessionInfo();
     if (InpSessionFilter && !session.is_active) {
-        Log("Outside trading sessions. Scanning paused.", true);
+        if (g_last_skip_reason != "session") {
+            Log("Outside trading sessions. Scanning paused.", true);
+            g_last_skip_reason = "session";
+        }
         return;
     }
 
     // ---- Guard: Spread filter ----
     if (!IsSpreadAcceptable()) {
-        Log("Spread too high. Skipping bar.", true);
+        if (g_last_skip_reason != "spread") {
+            long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+            Log(StringFormat("Spread too high (%d points). Scanning paused.", spread), true);
+            g_last_skip_reason = "spread";
+        }
         return;
     }
 
     // ---- Guard: Position already open ----
     if (IsPositionOpen()) {
-        Log("Position already open. No new entry.", true);
+        if (g_last_skip_reason != "spread") {
+            long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+            Log(StringFormat("Spread too high (%d points). Scanning paused.", spread), true);
+            g_last_skip_reason = "spread";
+        }
         return;
     }
+
+    // Clear skip reason once guards are successfully passed
+    g_last_skip_reason = "";
 
     // ---- Fetch M5 OHLCV data (last 600 bars) ----
     MqlRates rates[];
@@ -1962,8 +2005,6 @@ void RunMarketAnalysis() {
             return;
         }
     }
-
-    Print("Running strategy router...");
 
     // ---- Route through strategy engine ----
     SSignal signal = RouteStrategy(rates[1], g_current_atr);
@@ -2040,29 +2081,19 @@ int OnInit() {
         return INIT_FAILED;
     }
 
-    if (!WaitForIndicatorsReady()) {
-        Log("Indicator buffers failed to initialize.");
-        return INIT_FAILED;
-    }
-
     // ---- Configure trade engine ----
     g_trade.SetExpertMagicNumber(InpMagicNumber);
     g_trade.SetDeviationInPoints(20); // 2 pips max slippage
     g_trade.SetTypeFillingBySymbol(_Symbol); // Auto-detect broker's fill mode
     g_trade.SetAsyncMode(false); // Synchronous for reliability
 
-    // ---- Initialize indicator handles ----
+    // ---- 1. Initialize indicator handles FIRST ----
     g_h_atr = iATR(_Symbol, PERIOD_M5, InpATRPeriod);
     g_h_atr_ema = iMA(_Symbol, PERIOD_M5, InpATREMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    // NOTE: g_h_atr_ema uses MA on close as a proxy for ATR smoothing baseline
     g_h_ema50_h1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema200_h1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema50_m5 = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema200_m5 = iMA(_Symbol, PERIOD_M5, 200, 0, MODE_EMA, PRICE_CLOSE);
-
-    if (BarsCalculated(g_h_atr) < InpATRPeriod) {
-        Print("ATR not ready");
-    }
 
     // Verify all handles are valid
     if (g_h_atr == INVALID_HANDLE ||
@@ -2084,6 +2115,7 @@ int OnInit() {
     MqlRates tmp[];
     ArraySetAsSeries(tmp, true);
     int copied = CopyRates(_Symbol, PERIOD_M5, 0, InpStructureLookback + 20, tmp);
+
     if (copied > 5) {
         g_structure = DetectStructure(tmp, copied);
         g_current_atr = GetATR();
@@ -2110,6 +2142,7 @@ void OnDeinit(const int reason) {
     if (g_h_ema200_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_h1);
     if (g_h_ema50_m5 != INVALID_HANDLE) IndicatorRelease(g_h_ema50_m5);
     if (g_h_ema200_m5 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_m5);
+
     Log(StringFormat("Nexubot deinitialized. Reason: %d", reason));
 }
 
