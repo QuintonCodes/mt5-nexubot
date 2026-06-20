@@ -35,6 +35,7 @@ input group           "==== RISK MANAGEMENT ===="
 input double          InpRiskPercent       = 2.0;    // Risk per trade (% of balance)
 input double          InpMaxLotSize        = 1.0;    // Hard cap on lot size
 input double          InpMinRR             = 2.0;    // Min structural R/R before entry
+input double          InpMaxRR             = 4.0;    // Hard cap on structural R/R to prevent over-extension
 input bool            InpUseDynamicRisk    = true;   // Scale risk by account size tiers
 
 //--- Entry Filters (The Strict Funnel)
@@ -43,13 +44,16 @@ input int             InpMinSweepTier      = 2;      // Min liquidity sweep tier
 input bool            InpRequireHTFAlign   = true;   // Require H1 trend aligned to signal
 input bool            InpRequireBOS        = true;   // Require BOS or CHoCH confirmation
 input bool            InpSessionFilter     = true;   // Only trade during active killzones
-input int             InpMaxSpreadPoints   = 400;     // Max allowed spread in points (0=off)
-input double          InpMinVolRatio       = 1.3;    // Min volume ratio for displacement
+input int             InpMaxSpreadPoints   = 500;     // Max allowed spread in points (0=off)
+input double          InpMinVolRatio       = 1.3;     // Min volume ratio for displacement
+input bool            InpRequirePOIConfluence = true; // Require setup to trigger near an active POI
+input double          InpPOIProximityATR   = 1.0;     // Max distance to POI (x ATR) for confluence
 
 //--- ATR & Volatility
 input group           "==== ATR & VOLATILITY ===="
 input int             InpATRPeriod         = 14;     // ATR calculation period
 input int             InpATREMAPeriod      = 48;     // ATR EMA period (expansion baseline)
+input double          InpMinVolExpansion   = 0.85;   // Min ATR expansion ratio to permit trades
 input double          InpSLMultiplierBase  = 1.0;    // Base SL ATR multiplier
 input double          InpSLMultiplierHVol  = 1.3;    // SL ATR multiplier for volatile assets
 input double          InpMaxSLCapATR       = 3.5;    // Max SL cap (x ATR) — hard ceiling
@@ -72,6 +76,7 @@ input double          InpMinFVGVolRatio    = 1.5;    // Min vol ratio to create 
 input double          InpMinOBBodyRatio    = 0.65;   // Min body/range ratio for OB candle
 input double          InpMinOBVolRatio     = 1.2;    // Min vol ratio to create OB
 input int             InpWarmupBars        = 500;    // Historical bars for POI warmup
+input int             InpSignalCooldownBars = 3;     // Min bars to wait after a trade before allowing a new entry
 
 //--- Session Times  (Adjust to your broker's server timezone offset)
 input group           "==== SESSION TIMES (SERVER TIME) ===="
@@ -101,31 +106,27 @@ input ulong           InpMagicNumber       = 20260611; // EA magic number (uniqu
 //  Internal fixed values. Not user-editable but documented for transparency.
 //==========================================================================
 
-#define MAX_ZONES        100     // Hard cap for each POI array (FVG/IFVG/OB)
-#define MAX_PIVOTS       50      // Max pivot points to scan in structure detection
-#define MAX_TRADE_STATES 5       // Max concurrent tracked positions (per symbol EA = 1)
-#define INVALID_LEVEL    -1.0    // Sentinel for uninitialized price levels
-#define MIN_ATR_FLOOR    0.00001 // Minimum ATR value to prevent division-by-zero
+#define MAX_ZONES 100 // Hard cap for each POI array (FVG/IFVG/OB)
 
 //--- Zone types
 #define ZONE_BULL 0
 #define ZONE_BEAR 1
 
 //--- OB tiers
-#define OB_INTERNAL  0
-#define OB_MAJOR     1
-#define OB_BREAKER   2
+#define OB_INTERNAL 0
+#define OB_MAJOR 1
+#define OB_BREAKER 2
 
 //--- Sweep tiers
-#define SWEEP_NONE     0
+#define SWEEP_NONE 0
 #define SWEEP_INTERNAL 1
-#define SWEEP_MAJOR    2
-#define SWEEP_DAILY    3
+#define SWEEP_MAJOR 2
+#define SWEEP_DAILY 3
 
 //--- Structure states
-#define STRUCT_FLAT  0
-#define STRUCT_BULL  1
-#define STRUCT_BEAR  2
+#define STRUCT_FLAT 0
+#define STRUCT_BULL 1
+#define STRUCT_BEAR 2
 
 //==========================================================================
 //  SECTION 3: STRUCT DEFINITIONS
@@ -156,7 +157,6 @@ struct SStructureInfo {
     double prev_high;       // Second-to-last confirmed pivot high
     double prev_low;        // Second-to-last confirmed pivot low
     double pd_array;        // Premium/Discount status (0.0=full discount, 1.0=full premium)
-    int    bars_since_break;// Bars elapsed since the last structural break
     bool   valid;           // Data is populated and reliable
 };
 
@@ -208,8 +208,6 @@ int g_h_atr = INVALID_HANDLE; // ATR(14) on M5
 int g_h_atr_ema = INVALID_HANDLE; // ATR EMA on M5 (expansion ratio baseline)
 int g_h_ema50_h1 = INVALID_HANDLE; // EMA(50) on H1 for HTF trend
 int g_h_ema200_h1 = INVALID_HANDLE; // EMA(200) on H1 for HTF trend
-int g_h_ema50_m5 = INVALID_HANDLE; // EMA(50) on M5 for local structure
-int g_h_ema200_m5 = INVALID_HANDLE; // EMA(200) on M5 for local structure
 
 // --- POI arrays — fixed-size with active count trackers ---
 SZone g_fvgs[MAX_ZONES];
@@ -237,10 +235,11 @@ datetime g_last_bar_time = 0;
 
 // --- State tracking for log throttling ---
 string g_last_skip_reason = "";
+static datetime last_spread_log = 0;
 
 // --- Cooldown / throttle ---
 datetime g_last_signal_time = 0;
-int g_bars_since_last_signal = 0;
+int g_bars_since_last_signal = 9999;
 int g_bars_since_sweep = 9999; // Bars elapsed since the last Tier2+ sweep
 int g_recent_sweep_tier = SWEEP_NONE; // Tier of that most recent sweep
 int g_recent_sweep_dir = -1; // Direction of the most recent sweep (ZONE_BULL/ZONE_BEAR)
@@ -249,6 +248,7 @@ int g_recent_break_dir = STRUCT_FLAT; // Direction of that most recent break
 
 // --- Volatile asset identifier suffixes ---
 string g_volatile_ids[] = {"XAU", "XAG", "BTC", "ETH", "US30", "NAS", "SPX", "UK100", "GER40"};
+
 
 //==========================================================================
 //  SECTION 5: UTILITY & TECHNICAL ANALYSIS HELPERS
@@ -259,21 +259,25 @@ string g_volatile_ids[] = {"XAU", "XAG", "BTC", "ETH", "US30", "NAS", "SPX", "UK
 double GetATR() {
     if (g_h_atr == INVALID_HANDLE) return 0.0;
 
-    double buf[];
-    ArraySetAsSeries(buf, true);
+    // Scale floor to 50 points dynamically (5 pips for standard Forex, 50 points for Gold)
+    double MIN_ATR_FLOOR = 50 * _Point;
+
+    double atr[];
+    ArraySetAsSeries(atr, true);
     ResetLastError();
 
-    int copied = CopyBuffer(g_h_atr, 0, 1, 1, buf);
+    int copied = CopyBuffer(g_h_atr, 0, 1, 1, atr);
     if (copied < 1) {
         int err = GetLastError();
         // Suppress error 4806 as indicator data is not yet calculated on startup
         if (err != 4806 && InpVerboseLog) {
-            PrintFormat("ATR CopyBuffer failed. Error=%d", err);
+            PrintFormat("ATR CopyBuffer failed. Defaulting to dynamic floor. Error=%d", err);
         }
-        return 0.0;
-    };
+        return MIN_ATR_FLOOR;
+    }
 
-    return buf[0];
+    // Ensure the ATR never compresses tighter than our dynamic asset floor
+    return MathMax(atr[0], MIN_ATR_FLOOR);
 }
 
 /// @brief Returns the ATR expansion ratio (current ATR / ATR EMA).
@@ -336,7 +340,7 @@ double CalculateVWAP(const MqlRates &rates[], int total) {
         TimeToStruct(rates[i].time, dti);
 
         // Stop when we cross into the previous day
-        if (dti.day != dt0.day || dti.mon != dt0.mon) break;\
+        if (dti.day != dt0.day || dti.mon != dt0.mon) break;
 
         double typical = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
         cum_pv += typical * (double)rates[i].tick_volume;
@@ -362,6 +366,9 @@ double GetVolumeSMA(const MqlRates &rates[], int start, int period) {
 }
 
 /// @brief Calculates the body-to-range ratio of a single candle.
+/// A ratio of 0.0 indicates a doji, while 1.0 indicates a full marubozu.
+/// The ratio is clipped to the range [0, 1].
+/// @param bar The MqlRates structure representing the candle.
 /// @return 0.0 for doji, 1.0 for full marubozu. Clipped at [0, 1].
 double GetBodyRatio(const MqlRates &bar) {
     double rng = bar.high - bar.low;
@@ -370,6 +377,9 @@ double GetBodyRatio(const MqlRates &bar) {
 }
 
 /// @brief Returns true if the symbol contains any high-volatility identifier.
+/// This is used to adjust ATR multipliers for volatile assets like XAU, BTC, etc.
+/// @param symbol The symbol name to check (case-insensitive).
+/// @return True if the symbol is considered high-volatility.
 bool IsHighVolatility(const string symbol) {
     string sym_upper = symbol;
     StringToUpper(sym_upper);
@@ -382,31 +392,16 @@ bool IsHighVolatility(const string symbol) {
     return false;
 }
 
-/// @brief Checks whether the current spread is within acceptable limits.
-/// Returns true (acceptable) when InpMaxSpreadPoints = 0 (filter disabled).
-bool IsSpreadAcceptable() {
-    if (InpMaxSpreadPoints <= 0) return true;
-
-    long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-    long max_spread = (long)InpMaxSpreadPoints;
-
-    // XAU, BTC, and Indices naturally have much wider point spreads.
-    // If the asset is volatile, we scale the max allowed spread up by 10x
-    // to prevent the strategy tester from skipping valid bars indefinitely.
-    if (IsHighVolatility(_Symbol)) {
-        max_spread *= 10;
-    }
-
-    return spread <= max_spread;
-}
-
 /// @brief Logs a message to the Experts log. Prepends EA identifier.
+/// @param msg The message to log.
+/// @param verbose_only If true, only logs if InpVerboseLog is enabled.
 void Log(const string msg, bool verbose_only = false) {
     if (verbose_only && !InpVerboseLog) return;
     PrintFormat("[Nexubot] %s", msg);
 }
 
 /// @brief Helper function to prevent log spam for consecutive identical skip reasons
+/// @param reason The reason for skipping a trade signal.
 void PrintThrottledSkipReason(string reason) {
     if (reason != g_last_skip_reason) {
         Log(reason, true); // Uses your existing Log() function
@@ -462,10 +457,14 @@ void GetAsianRange(double &asian_high, double &asian_low) {
         // Stop scanning when we cross into the previous day
         if (bar_dt.day != today_dt.day || bar_dt.mon != today_dt.mon) break;
 
-        // Only accumulate bars within the Asian session window
-        if (bar_dt.hour >= InpAsianStart && bar_dt.hour < InpAsianEnd) {
+        // Only accumulate bars within the Asian session window (handles midnight wrap)
+        bool is_asian_bar = (InpAsianStart < InpAsianEnd) ?
+                            (bar_dt.hour >= InpAsianStart && bar_dt.hour < InpAsianEnd) :
+                            (bar_dt.hour >= InpAsianStart || bar_dt.hour < InpAsianEnd);
+
+        if (is_asian_bar) {
             asian_high = MathMax(asian_high, rates[i].high);
-            asian_low = MathMin(asian_low,  rates[i].low);
+            asian_low = MathMin(asian_low, rates[i].low);
         }
     }
 
@@ -474,6 +473,10 @@ void GetAsianRange(double &asian_high, double &asian_low) {
 }
 
 /// @brief Returns the N-bar rolling minimum low (from index start to start+N).
+/// @param rates  Array of MqlRates in series order (0=newest).
+/// @param start  Starting index (0=newest bar).
+/// @param n_bars Number of bars to consider (must be > 0).
+/// @return Minimum low price over the specified range, or 0.0 if no valid bars.
 double GetRecentLow(const MqlRates &rates[], int start, int n_bars) {
     int total = ArraySize(rates);
     double lo = DBL_MAX;
@@ -485,6 +488,10 @@ double GetRecentLow(const MqlRates &rates[], int start, int n_bars) {
 }
 
 /// @brief Returns the N-bar rolling maximum high (from index start to start+N).
+/// @param rates  Array of MqlRates in series order (0=newest).
+/// @param start  Starting index (0=newest bar).
+/// @param n_bars Number of bars to consider (must be > 0).
+/// @return Maximum high price over the specified range, or 0.0 if no valid bars.
 double GetRecentHigh(const MqlRates &rates[], int start, int n_bars) {
     int total = ArraySize(rates);
     double hi = 0.0;
@@ -495,7 +502,6 @@ double GetRecentHigh(const MqlRates &rates[], int start, int n_bars) {
     return hi;
 }
 
-
 //==========================================================================
 //  SECTION 7: PIVOT DETECTION
 //  Uses a symmetric window to identify confirmed structural pivots.
@@ -505,6 +511,10 @@ double GetRecentHigh(const MqlRates &rates[], int start, int n_bars) {
 
 /// @brief Returns true if rates[idx].high is the highest within the lookback window.
 /// Only processes CONFIRMED pivots — will not fire on recent unconfirmed bars.
+/// @param rates Array of MqlRates in series order (0=newest).
+/// @param idx Index of the candidate pivot bar (0=newest).
+/// @param lookback Number of bars to check on each side (symmetric).
+/// @return True if the bar at idx is a confirmed pivot high.
 bool IsPivotHigh(const MqlRates &rates[], int idx, int lookback) {
     int total = ArraySize(rates);
 
@@ -521,6 +531,11 @@ bool IsPivotHigh(const MqlRates &rates[], int idx, int lookback) {
 }
 
 /// @brief Returns true if rates[idx].low is the lowest within the lookback window.
+/// Only processes CONFIRMED pivots — will not fire on recent unconfirmed bars.
+/// @param rates Array of MqlRates in series order (0=newest).
+/// @param idx Index of the candidate pivot bar (0=newest).
+/// @param lookback Number of bars to check on each side (symmetric).
+/// @return True if the bar at idx is a confirmed pivot low.
 bool IsPivotLow(const MqlRates &rates[], int idx, int lookback) {
     int total = ArraySize(rates);
 
@@ -604,8 +619,6 @@ SStructureInfo DetectStructure(const MqlRates &rates[], int total) {
     result.pd_array = (pd_range > 0) ?
         MathMax(0.0, MathMin(1.0, (curr_close - last_low) / pd_range)) : 0.5;
 
-    // Bars since last structural pivot (for feature scoring)
-    result.bars_since_break = InpPivotLookback; // Conservative estimate
     result.valid = true;
 
     return result;
@@ -625,14 +638,19 @@ SStructureInfo DetectStructure(const MqlRates &rates[], int total) {
 /// @param recent_high Recent 5-bar high.
 /// @param recent_low Recent 5-bar low.
 /// @param atr Current ATR.
+/// @return True if the close is within 0.5 ATR of a round number.
 bool IsRoundNumberSweep(double close_price, double recent_high, double recent_low, double atr) {
     if (close_price <= 0) return false;
-    // Determine magnitude step: price 1.23456 → magnitude=1, step=0.1
-    //                           price 12345.6 → magnitude=10000, step=1000
-    double magnitude = MathPow(10.0, MathFloor(MathLog10(close_price)));
-    double step = magnitude / 10.0;
 
-    if (magnitude <= 10) step = 1.0;
+    double magnitude = MathPow(10.0, MathFloor(MathLog10(close_price)));
+    double step;
+
+    // Forex pairs (magnitude 1) should step by 0.01 (e.g., 1.0800, 1.0900)
+    if (magnitude <= 10) {
+        step = 0.01;
+    } else {
+        step = magnitude / 100.0; // e.g., Index at 5200 steps by 52 (rounds to 50s/100s)
+    }
 
     double closest_round = MathRound(close_price / step) * step;
     double dist_to_round = MathMin(
@@ -649,6 +667,7 @@ bool IsRoundNumberSweep(double close_price, double recent_high, double recent_lo
 /// @param atr Current ATR value.
 /// @param tier [Output] Sweep tier: 0=none, 1=internal, 2=major, 3=daily.
 /// @param depth_atr [Output] Sweep depth expressed in ATR multiples.
+/// @param sweep_dir [Output] Direction of the sweep: ZONE_BULL or ZONE_BEAR.
 void DetectLiquiditySweep(const MqlRates &rates[], int total,
                           double atr, int &tier, double &depth_atr, int &sweep_dir) {
     tier = SWEEP_NONE;
@@ -667,15 +686,11 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
     double major_lo50 = GetRecentLow(rates, 1 + shift, InpMajorSwingPeriod);
     double major_hi50 = GetRecentHigh(rates, 1 + shift, InpMajorSwingPeriod);
 
-    // --- Determine if we are currently in the London session (Asian sweep prime time)
-    MqlDateTime curr_dt;
-    TimeToStruct(rates[1].time, curr_dt);
-    bool is_london = (curr_dt.hour >= InpLondonStart && curr_dt.hour < InpLondonEnd);
+    // Fetch centralized session state
+    SSessionInfo session = GetSessionInfo();
 
     // -----------------------------------------------------------------------
     // TIER 3: Daily PDH/PDL and Asian Session Range Sweeps
-    // These represent the highest-quality institutional setups.
-    // Condition: Price SWEPT through the level and CLOSED BACK on the other side.
     // -----------------------------------------------------------------------
     if (g_pdl > 0 && rec_lo5 < g_pdl && close > g_pdl) {
         tier = SWEEP_DAILY;
@@ -689,14 +704,14 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
         sweep_dir = ZONE_BEAR;
         return;
     }
-    // Asian range sweeps — most significant during London open (Power of 3)
-    if (is_london && g_asian_low > 0 && rec_lo5 < g_asian_low && close > g_asian_low) {
+    // Restrict Asian range sweeps to the London Open killzone
+    if (session.is_london_open && g_asian_low > 0 && rec_lo5 < g_asian_low && close > g_asian_low) {
         tier = SWEEP_DAILY;
         depth_atr = (g_asian_low - rec_lo5) / atr;
         sweep_dir = ZONE_BULL;
         return;
     }
-    if (is_london && g_asian_high > 0 && rec_hi5 > g_asian_high && close < g_asian_high) {
+    if (session.is_london_open && g_asian_high > 0 && rec_hi5 > g_asian_high && close < g_asian_high) {
         tier = SWEEP_DAILY;
         depth_atr = (rec_hi5 - g_asian_high) / atr;
         sweep_dir = ZONE_BEAR;
@@ -770,14 +785,18 @@ void CompactZoneArray(SZone &zones[], int &count) {
 /// @brief Adds a new zone to an array if capacity allows.
 /// If the array is full, the oldest zone is evicted (FIFO).
 void AddZone(SZone &zones[], int &count, const SZone &new_zone) {
-    if (count < MAX_ZONES) {
+    // Cap the logical size to the user input, safely bounded by the macro
+    int max_allowed = (int)MathMin(InpMaxPOIsPerType, MAX_ZONES);
+
+    if (count < max_allowed) {
         zones[count] = new_zone;
         count++;
     } else {
         // Evict oldest (index 0), shift all zones left, append new at end
-        for (int i = 0; i < MAX_ZONES - 1; i++) zones[i] = zones[i + 1];
-        zones[MAX_ZONES - 1] = new_zone;
-        count = MAX_ZONES;
+        for (int i = 0; i < max_allowed - 1; i++) zones[i] = zones[i + 1];
+
+        zones[max_allowed - 1] = new_zone;
+        count = max_allowed;
     }
 }
 
@@ -895,12 +914,11 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
 
     // ---- Step 4: Create new FVGs from c2's price action ----
     // FVG conditions: c2 is a strong displacement candle AND there is a true gap
-    double c2_body = MathAbs(c2.close - c2.open);
-    double c2_range = c2.high - c2.low;
     double c2_vol_ratio = (vol_sma_c2 > 0) ? ((double)c2.tick_volume / vol_sma_c2) : 1.0;
-    double c2_body_ratio = (c2_range > 0) ? (c2_body / c2_range) : 0.0;
 
-    if (c2_vol_ratio >= InpMinFVGVolRatio && c2_body_ratio >= 0.65) {
+    double c2_body_ratio = GetBodyRatio(c2);
+
+    if (c2_vol_ratio >= InpMinFVGVolRatio && c2_body_ratio >= InpMinOBBodyRatio) {
         // Bull FVG: gap between c1.high and curr.low, c2 is bullish displacement
         if (c1.high < curr.low && c2.close > c2.open) {
             SZone fvg;
@@ -929,8 +947,9 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
     int ob_tier = (c2_vol_ratio >= 1.5) ? OB_MAJOR : OB_INTERNAL;
 
     // Bull OB: c2 is bullish, c1 was bearish, c2 closes above c1.high (engulf)
+    // Enforce the body ratio to prevent low-quality wick engulfments
     if (c2.close > c2.open && c1.close < c1.open &&
-        c2.close > c1.high && c2_vol_ratio >= InpMinOBVolRatio) {
+        c2.close > c1.high && c2_vol_ratio >= InpMinOBVolRatio && c2_body_ratio >= InpMinOBBodyRatio) {
         SZone ob;
         ZeroMemory(ob);
         ob.active = true;
@@ -943,7 +962,7 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
     }
     // Bear OB: c2 is bearish, c1 was bullish, c2 closes below c1.low (engulf)
     else if (c2.close < c2.open && c1.close > c1.open &&
-             c2.close < c1.low && c2_vol_ratio >= InpMinOBVolRatio) {
+             c2.close < c1.low && c2_vol_ratio >= InpMinOBVolRatio && c2_body_ratio >= InpMinOBBodyRatio) {
         SZone ob;
         ZeroMemory(ob);
         ob.active = true;
@@ -992,6 +1011,7 @@ void WarmupPOIs() {
 /// @param close_price Current price.
 /// @param atr Current ATR.
 /// @param proximity Max distance in ATR multiples.
+/// @return true if a bullish POI is found within the specified proximity, false otherwise.
 bool HasActiveBullPOI(double close_price, double atr, double proximity = 0.5) {
     // Check FVGs
     for (int i = 0; i < g_fvg_count; i++) {
@@ -1013,6 +1033,10 @@ bool HasActiveBullPOI(double close_price, double atr, double proximity = 0.5) {
 }
 
 /// @brief Checks if there is a relevant active bearish POI within proximity.
+/// @param close_price Current price.
+/// @param atr Current ATR.
+/// @param proximity Max distance in ATR multiples.
+/// @return true if a bearish POI is found within the specified proximity, false otherwise.
 bool HasActiveBearPOI(double close_price, double atr, double proximity = 0.5) {
     for (int i = 0; i < g_fvg_count; i++) {
         if (!g_fvgs[i].active || g_fvgs[i].zone_type != ZONE_BEAR) continue;
@@ -1084,6 +1108,7 @@ double GetNearestOpposingPOI(int direction, double entry) {
 //==========================================================================
 
 /// @brief Returns the current session context based on server time.
+/// @return SSessionInfo struct with session name, multiplier, and flags.
 SSessionInfo GetSessionInfo() {
     SSessionInfo info;
     ZeroMemory(info);
@@ -1093,9 +1118,18 @@ SSessionInfo GetSessionInfo() {
     TimeToStruct(TimeCurrent(), dt);
     int h = dt.hour;
 
-    bool is_asian = (h >= InpAsianStart && h < InpAsianEnd);
-    bool is_london = (h >= InpLondonStart && h < InpLondonEnd);
-    bool is_ny = (h >= InpNYStart && h < InpNYEnd);
+    // Robust midnight-crossing checks
+    bool is_asian = (InpAsianStart < InpAsianEnd) ?
+                    (h >= InpAsianStart && h < InpAsianEnd) :
+                    (h >= InpAsianStart || h < InpAsianEnd);
+
+    bool is_london = (InpLondonStart < InpLondonEnd) ?
+                     (h >= InpLondonStart && h < InpLondonEnd) :
+                     (h >= InpLondonStart || h < InpLondonEnd);
+
+    bool is_ny = (InpNYStart < InpNYEnd) ?
+                 (h >= InpNYStart && h < InpNYEnd) :
+                 (h >= InpNYStart || h < InpNYEnd);
 
     info.is_active = is_asian || is_london || is_ny;
     info.is_london_open = (h >= InpLondonStart && h < InpLondonStart + 3); // First 3hrs
@@ -1128,14 +1162,10 @@ SSessionInfo GetSessionInfo() {
 
 /// @brief STRATEGY 1: Liquidity Sweep with BOS confirmation.
 /// Highest quality setup. Requires a Tier-2+ sweep AND a structural break
-/// to have BOTH occurred within their respective recency windows
-/// (InpSweepRecencyBars / InpBOSRecencyBars). They do not need to land on
-/// the exact same candle — a sweep that gets confirmed by a BOS a few bars
-/// later is still a valid "sweep-then-break" institutional pattern, and
-/// requiring strict same-candle coincidence made this strategy virtually
-/// impossible to trigger.
+/// to have BOTH occurred within their respective recency windows.
 /// @param curr Last confirmed bar (rates[1]).
 /// @param atr Current ATR.
+/// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
@@ -1160,7 +1190,8 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
         sig.strategy_name = name;
         sig.order_type = "MARKET";
         sig.suggested_sl = curr.low - atr_buf;
-    } else if (bos_dir == STRUCT_BEAR) {
+    }
+    else if (bos_dir == STRUCT_BEAR) {
         sig.valid = true;
         sig.direction = ZONE_BEAR;
         sig.strategy_name = name;
@@ -1177,6 +1208,7 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
 /// Historically the cleanest "smart money" entry model.
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
+/// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
@@ -1191,11 +1223,13 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     // Volume confirmation for OTE entries
     MqlRates rates_check[];
     ArraySetAsSeries(rates_check, true);
+
     double vol_sma = 1.0;
     if (CopyRates(_Symbol, PERIOD_M5, 1, 25, rates_check) == 25)
         vol_sma = GetVolumeSMA(rates_check, 1, 20);
+
     double vol_ratio = (double)curr.tick_volume / vol_sma;
-    if (vol_ratio < 1.2) return sig; // Require at least moderate volume
+    if (vol_ratio < InpMinVolRatio) return sig; // Require at least moderate volume
 
     // Bullish OTE: Structure is BULL + H1 trending up → buy the dip to 62-79%
     if (g_structure.structure == STRUCT_BULL && g_htf_trend == 1.0) {
@@ -1209,6 +1243,7 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
             sig.suggested_sl = g_structure.last_low - atr_buf;
         }
     }
+
     // Bearish OTE: Structure is BEAR + H1 trending down → sell the rally to 62-79%
     else if (g_structure.structure == STRUCT_BEAR && g_htf_trend == -1.0) {
         double fib_62 = g_structure.last_low + range * 0.618;
@@ -1230,6 +1265,7 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
 /// close to be on the "correct" side of the IFVG CE (midpoint).
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
+/// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
@@ -1284,7 +1320,7 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
 /// for MAJOR/BREAKER OBs to ensure the institutional defending entity is
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
-/// @param sweep_tier Current sweep tier.
+/// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
@@ -1373,6 +1409,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
 /// - A Tier 2+ sweep already completed (avoid counter-trend traps)
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
+/// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
@@ -1381,11 +1418,13 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
     // Require institutional volume: vol > vol_sma × 1.2
     MqlRates tmp[];
     ArraySetAsSeries(tmp, true);
+
     double vol_sma = 1.0;
     if (CopyRates(_Symbol, PERIOD_M5, 1, 25, tmp) == 25)
         vol_sma = GetVolumeSMA(tmp, 1, 20);
+
     double vol_str = (double)curr.tick_volume / vol_sma;
-    if (vol_str < 1.2) return sig;
+    if (vol_str < InpMinVolRatio) return sig;
 
     double atr_buf = atr * 0.3;
 
@@ -1397,6 +1436,7 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
         sig.order_type = "MARKET";
         sig.suggested_sl = curr.low - atr_buf;
     }
+
     // Bearish VWAP rejection: recent high touched VWAP, closed below it with red body
     else if (curr.high >= g_vwap && curr.close < g_vwap && curr.close < curr.open && g_recent_sweep_dir == ZONE_BEAR) {
         sig.valid = true;
@@ -1405,6 +1445,7 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
         sig.order_type = "MARKET";
         sig.suggested_sl = curr.high + atr_buf;
     }
+
     return sig;
 }
 
@@ -1476,6 +1517,9 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
 
 /// @brief Returns the maximum allowed risk percentage based on account
 /// size and currency
+/// @param balance Current account balance.
+/// @param currency Account currency string (e.g., "USD", "ZAR").
+/// @return Maximum risk percentage to apply for lot size calculation.
 double GetRiskCap(double balance, string currency) {
     if (!InpUseDynamicRisk) return InpRiskPercent;
 
@@ -1496,47 +1540,59 @@ double GetRiskCap(double balance, string currency) {
     }
 }
 
-/// @brief Validates that the proposed SL/TP achieves the minimum R/R ratio.
-/// @return true if R/R >= InpMinRR, false otherwise.
-bool ValidateRiskReward(double entry, double sl, double tp, bool is_long) {
-    double sl_dist = MathAbs(entry - sl);
-    double tp_dist = MathAbs(tp - entry);
-
-    if (sl_dist <= 0) return false;
-
-    double rr = tp_dist / sl_dist;
-
-    return rr >= InpMinRR;
-}
-
 /// @brief Calculates the lot size based on risk percentage, SL distance,
 /// and account balance. Clamps to broker-specified lot step limits.
-/// @param sl_distance  Distance from entry to SL in price terms.
+/// @param entry_price Entry price.
+/// @param sl_price Stop loss price.
+/// @param order_type Order type (BUY/SELL) to determine SL distance direction.
+/// @param session_multiplier Multiplier to adjust lot size based on session characteristics.
 /// @return Validated lot size, or 0.0 if calculation fails.
-double CalculateLotSize(double sl_distance) {
+double CalculateLotSize(double entry_price, double sl_price, ENUM_ORDER_TYPE order_type, double session_multiplier = 1.0) {
     double balance = AccountInfoDouble(ACCOUNT_BALANCE);
     string currency = AccountInfoString(ACCOUNT_CURRENCY);
-    double risk_pct = GetRiskCap(balance, currency);
-    double risk_amt = balance * (risk_pct / 100.0);
+
+    // --- Dynamic Risk Tiering Integration ---
+    double applied_risk_pct = GetRiskCap(balance, currency);
+
+    // Scale the baseline risk capital by the session's confidence modifier
+    double risk_amount = balance * (applied_risk_pct / 100.0) * session_multiplier;
 
     double tick_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    if (tick_value <= 0 || tick_size <= 0) return 0.0;
+    double sl_distance = MathAbs(entry_price - sl_price);
 
-    double risk_per_lot = (sl_distance / tick_size) * tick_value;
-    if (risk_per_lot <= 0) return 0.0;
+    // Prevent division by zero
+    if (sl_distance <= 0 || tick_size == 0 || tick_value == 0)
+        return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
 
-    double lots = risk_amt / risk_per_lot;
+    // Calculate initial lot size based on structural Risk
+    double loss_per_lot = (sl_distance / tick_size) * tick_value;
+    double lot_size = risk_amount / loss_per_lot;
+
+    // --- LEVERAGE & MARGIN PROTECTION ---
+    double margin_required = 0.0;
+    if (!OrderCalcMargin(order_type, _Symbol, lot_size, entry_price, margin_required)) {
+        Print("[Nexubot] OrderCalcMargin failed. Enforcing minimal risk state.");
+        lot_size = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    } else {
+        double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+        double max_margin_allowed = free_margin * 0.80; // Cap margin exposure to 80% of free margin
+
+        if (margin_required > max_margin_allowed) {
+            // Scale lot size down proportionally to respect leverage constraints
+            double leverage_ratio = max_margin_allowed / margin_required;
+            lot_size = lot_size * leverage_ratio;
+            PrintFormat("[Nexubot] Leverage Cap Triggered: Lot scaled down to %.2f (Margin Required: %.2f | Free: %.2f)", lot_size, margin_required, free_margin);
+        }
+    }
 
     // Clamp to broker limits
     double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double max_lot = MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), InpMaxLotSize);
-    double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-    lots = MathFloor(lots / lot_step) * lot_step;
-    lots = MathMax(min_lot, MathMin(lots, max_lot));
-
-    return NormalizeDouble(lots, 2);
+    lot_size = MathFloor(lot_size / step) * step;
+    return MathMax(min_lot, MathMin(lot_size, max_lot));
 }
 
 /// @brief Calculates final SL price, TP3 price, and intermediate TP levels.
@@ -1605,10 +1661,20 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
         actual_tp_dist = entry - tp3_price;
     }
 
-    // Validate minimum R/R after structural capping
-    double rr = (sl_dist > 0) ? (actual_tp_dist / sl_dist) : 0.0;
-    if (rr < InpMinRR) {
-        PrintThrottledSkipReason(StringFormat("R/R too low (%.2f < %.2f). Skipping.", rr, InpMinRR));
+    // --- UNIFIED LOGIC: Maximum R/R Clamping ---
+    double current_rr = (sl_dist > 0) ? (actual_tp_dist / sl_dist) : 0.0;
+
+    if (current_rr > InpMaxRR) {
+        actual_tp_dist = sl_dist * InpMaxRR; // Clamp distance to Max RR
+        tp3_price = is_long ? (entry + actual_tp_dist) : (entry - actual_tp_dist);
+
+        PrintThrottledSkipReason(StringFormat("Extreme RR normalized. Clamped from %.2f to %.2f", current_rr, InpMaxRR));
+        current_rr = InpMaxRR; // Sync current_rr for the MinRR check below
+    }
+
+    // --- UNIFIED LOGIC: Minimum R/R Validation ---
+    if (current_rr < InpMinRR) {
+        PrintThrottledSkipReason(StringFormat("R/R too low (%.2f < %.2f). Skipping.", current_rr, InpMinRR));
         return false;
     }
 
@@ -1639,7 +1705,6 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
 /// @return true if order was placed successfully.
 bool ExecuteTrade(const SSignal &signal, double sl, double tp1, double tp2,
                   double tp3, double lots, double atr) {
-    Print("EXECUTE TRADE REACHED");
     bool is_long = (signal.direction == ZONE_BULL);
     double entry = is_long ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                            : SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -1700,19 +1765,22 @@ bool ExecuteTrade(const SSignal &signal, double sl, double tp1, double tp2,
 //==========================================================================
 
 /// @brief Returns true if the Nexubot-managed position is still open.
+/// @return true if the position is open, false otherwise.
 bool IsPositionOpen() {
     if (!g_pos_state.active) return false;
-    return PositionSelectByTicket(g_pos_state.ticket);
+
+    return g_position_info.SelectByTicket(g_pos_state.ticket);
 }
 
 /// @brief Modifies the stop loss of the active position.
-/// @param new_sl  New stop loss price.
+/// @param new_sl New stop loss price.
 /// @return true if modification succeeded.
 bool ModifyStopLoss(double new_sl) {
-    if (!PositionSelectByTicket(g_pos_state.ticket)) return false;
+    if (!g_position_info.SelectByTicket(g_pos_state.ticket)) return false;
+
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    double curr_sl = PositionGetDouble(POSITION_SL);
-    double curr_tp = PositionGetDouble(POSITION_TP);
+    double curr_sl = g_position_info.StopLoss();
+    double curr_tp = g_position_info.TakeProfit();
     new_sl = NormalizeDouble(new_sl, digits);
 
     // Only move SL in the favourable direction (never widen SL)
@@ -1724,6 +1792,7 @@ bool ModifyStopLoss(double new_sl) {
         g_pos_state.current_sl = new_sl;
         Log(StringFormat("SL updated for %s: %.5f → %.5f", _Symbol, curr_sl, new_sl), true);
     }
+
     return ok;
 }
 
@@ -1764,7 +1833,6 @@ void ManagePosition() {
                                             : (curr_price <= g_pos_state.tp1);
 
         if (hit_tp1) {
-            g_pos_state.tp1_hit = true;
             // BE price = entry + ATR buffer (long) or entry - ATR buffer (short)
             double be_price;
             if (g_pos_state.is_long)
@@ -1773,7 +1841,9 @@ void ManagePosition() {
                 be_price = g_pos_state.entry_price - g_pos_state.atr_at_entry * InpBEBufferATR;
 
             be_price = NormalizeDouble(be_price, digits);
+
             if (ModifyStopLoss(be_price)) {
+                g_pos_state.tp1_hit = true; // State is only updated upon broker success
                 g_pos_state.be_set = true;
                 string msg = StringFormat("🎯 %s TP1 Hit! SL moved to Breakeven: %.5f", _Symbol, be_price);
                 Log(msg);
@@ -1789,9 +1859,10 @@ void ManagePosition() {
                                             : (curr_price <= g_pos_state.tp2);
 
         if (hit_tp2) {
-            g_pos_state.tp2_hit = true;
             double trail_sl = NormalizeDouble(g_pos_state.tp1, digits);
+
             if (ModifyStopLoss(trail_sl)) {
+                g_pos_state.tp2_hit = true; // State is only updated upon broker success
                 string msg = StringFormat("🎯 %s TP2 Hit! Trailing SL to TP1: %.5f", _Symbol, trail_sl);
                 Log(msg);
                 if (InpEnableAlerts) Alert(msg);
@@ -1801,7 +1872,6 @@ void ManagePosition() {
     }
 }
 
-
 //==========================================================================
 //  SECTION 16: MAIN MARKET ANALYSIS RUNNER
 //  Orchestrates all subsystems when a new M5 bar is confirmed.
@@ -1809,8 +1879,10 @@ void ManagePosition() {
 //==========================================================================
 
 /// @brief Full market analysis pipeline executed on each new M5 bar close.
-/// Follows the strict 5-condition funnel before generating any signal.
 void RunMarketAnalysis() {
+    // Increment the cooldown tracker right at the start of the new bar execution
+    g_bars_since_last_signal++;
+
     // ---- Guard: Session filter ----
     SSessionInfo session = GetSessionInfo();
     if (InpSessionFilter && !session.is_active) {
@@ -1822,13 +1894,21 @@ void RunMarketAnalysis() {
     }
 
     // ---- Guard: Spread filter ----
-    if (!IsSpreadAcceptable()) {
-        if (g_last_skip_reason != "spread") {
-            long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-            PrintThrottledSkipReason(StringFormat("Spread too high (%d points). Scanning paused.", spread));
-            g_last_skip_reason = "spread";
+    int current_spread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+    int max_spread_allowed = InpMaxSpreadPoints;
+
+    // Dynamically scale the allowed spread by 10x for high-volatility assets (XAU, BTC, Indices)
+    if (IsHighVolatility(_Symbol)) {
+        max_spread_allowed *= 10;
+    }
+
+    if (max_spread_allowed > 0 && current_spread > max_spread_allowed) {
+        // Throttle: Only log the spread warning once every 5 minutes (300 seconds)
+        if (TimeCurrent() - last_spread_log >= 300) {
+            PrintFormat("[Nexubot] Spread too high (%d points > Max %d). Scanning paused.", current_spread, max_spread_allowed);
+            last_spread_log = TimeCurrent();
         }
-        return;
+        return; // Exit cycle safely
     }
 
     // ---- Guard: Position already open ----
@@ -1837,6 +1917,13 @@ void RunMarketAnalysis() {
             PrintThrottledSkipReason("Position already open. Scanning paused.");
             g_last_skip_reason = "position";
         }
+        return;
+    }
+
+    // ---- Guard: Signal Cooldown ----
+    if (InpSignalCooldownBars > 0 && g_bars_since_last_signal < InpSignalCooldownBars) {
+        PrintThrottledSkipReason(StringFormat("Cooldown active (%d/%d bars). Scanning paused.",
+                                              g_bars_since_last_signal, InpSignalCooldownBars));
         return;
     }
 
@@ -1858,6 +1945,14 @@ void RunMarketAnalysis() {
 
     if (g_current_atr <= 0) {
         Log("ATR not ready. Skipping.", true);
+        return;
+    }
+
+    // ---- Guard: Volatility Expansion Filter ----
+    double atr_expansion = GetATRExpansionRatio();
+    if (atr_expansion < InpMinVolExpansion) {
+        PrintThrottledSkipReason(StringFormat("Volatility contracting (Ratio: %.2f < %.2f). Scanning paused.",
+                                              atr_expansion, InpMinVolExpansion));
         return;
     }
 
@@ -1921,6 +2016,25 @@ void RunMarketAnalysis() {
         return;
     }
 
+    // ---- Guard: POI Confluence Filter ----
+    // Ensures trades are not taken in "no man's land" by requiring nearby institutional backing
+    if (InpRequirePOIConfluence) {
+        bool has_poi = false;
+        double close_price = rates[1].close;
+
+        if (signal.direction == ZONE_BULL) {
+            has_poi = HasActiveBullPOI(close_price, g_current_atr, InpPOIProximityATR);
+        } else if (signal.direction == ZONE_BEAR) {
+            has_poi = HasActiveBearPOI(close_price, g_current_atr, InpPOIProximityATR);
+        }
+
+        if (!has_poi) {
+            PrintThrottledSkipReason(StringFormat("Signal rejected: No active %s POI within %.1f ATR.",
+                                     (signal.direction == ZONE_BULL ? "Bullish" : "Bearish"), InpPOIProximityATR));
+            return;
+        }
+    }
+
     // ---- HTF alignment check against signal direction ----
     if (InpRequireHTFAlign) {
         if (signal.direction == ZONE_BULL && g_htf_trend != 1.0) {
@@ -1948,7 +2062,9 @@ void RunMarketAnalysis() {
 
     // ---- Calculate lot size ----
     double sl_dist = MathAbs(entry - sl_price);
-    double lots = CalculateLotSize(sl_dist);
+    ENUM_ORDER_TYPE order_type = (signal.direction == ZONE_BULL) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+    double lots = CalculateLotSize(entry, sl_price, order_type, session.multiplier);
     if (lots <= 0) {
         Log("Lot size calculation failed. Skipping.", false);
         return;
@@ -1961,9 +2077,13 @@ void RunMarketAnalysis() {
               g_htf_trend, MathAbs(tp3 - entry) / sl_dist));
 
     // ---- Execute the trade ----
-    ExecuteTrade(signal, sl_price, tp1, tp2, tp3, lots, g_current_atr);
+    bool executed = ExecuteTrade(signal, sl_price, tp1, tp2, tp3, lots, g_current_atr);
 
-    g_last_skip_reason = ""; // Reset after a successful trade execution
+    if (executed) {
+        g_bars_since_last_signal = 0;
+        g_last_signal_time = TimeCurrent();
+        g_last_skip_reason = ""; // Reset after a successful trade execution
+    }
 }
 
 //==========================================================================
@@ -1992,11 +2112,10 @@ int OnInit() {
     g_h_atr_ema = iMA(_Symbol, PERIOD_M5, InpATREMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema50_h1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema200_h1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
-    g_h_ema50_m5 = iMA(_Symbol, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE);
-    g_h_ema200_m5 = iMA(_Symbol, PERIOD_M5, 200, 0, MODE_EMA, PRICE_CLOSE);
 
     // Verify all handles are valid
     if (g_h_atr == INVALID_HANDLE ||
+        g_h_atr_ema == INVALID_HANDLE ||
         g_h_ema50_h1 == INVALID_HANDLE ||
         g_h_ema200_h1 == INVALID_HANDLE) {
         Log("CRITICAL: Failed to create indicator handles. Check symbol availability.");
@@ -2030,31 +2149,33 @@ int OnInit() {
 
     // Recover active position state in case of EA or terminal restart
     for (int i = PositionsTotal() - 1; i >= 0; i--) {
-        ulong ticket = PositionGetTicket(i);
-        if (PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
-            g_pos_state.active = true;
-            g_pos_state.ticket = ticket;
-            g_pos_state.is_long = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
-            g_pos_state.entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
-            g_pos_state.current_sl = PositionGetDouble(POSITION_SL);
+        if (g_position_info.SelectByIndex(i)) {
+            if (g_position_info.Symbol() == _Symbol && g_position_info.Magic() == InpMagicNumber) {
+                g_pos_state.active = true;
+                g_pos_state.ticket = g_position_info.Ticket();
+                g_pos_state.is_long = (g_position_info.PositionType() == POSITION_TYPE_BUY);
+                g_pos_state.entry_price = g_position_info.PriceOpen();
+                g_pos_state.current_sl = g_position_info.StopLoss();
 
-            // Re-calculate intermediate TP levels based on existing open position data
-            double tp3 = PositionGetDouble(POSITION_TP);
-            double tp_dist = MathAbs(tp3 - g_pos_state.entry_price);
+                // Re-calculate intermediate TP levels based on existing open position data
+                double tp3 = g_position_info.TakeProfit();
+                double tp_dist = MathAbs(tp3 - g_pos_state.entry_price);
 
-            if (g_pos_state.is_long) {
-                g_pos_state.tp1 = g_pos_state.entry_price + tp_dist * InpTP1Ratio;
-                g_pos_state.tp2 = g_pos_state.entry_price + tp_dist * InpTP2Ratio;
-            } else {
-                g_pos_state.tp1 = g_pos_state.entry_price - tp_dist * InpTP1Ratio;
-                g_pos_state.tp2 = g_pos_state.entry_price - tp_dist * InpTP2Ratio;
+                if (g_pos_state.is_long) {
+                    g_pos_state.tp1 = g_pos_state.entry_price + tp_dist * InpTP1Ratio;
+                    g_pos_state.tp2 = g_pos_state.entry_price + tp_dist * InpTP2Ratio;
+                } else {
+                    g_pos_state.tp1 = g_pos_state.entry_price - tp_dist * InpTP1Ratio;
+                    g_pos_state.tp2 = g_pos_state.entry_price - tp_dist * InpTP2Ratio;
+                }
+
+                g_pos_state.tp3 = tp3;
+                g_pos_state.atr_at_entry = g_current_atr > 0 ? g_current_atr : GetATR();
+                g_pos_state.open_time = g_position_info.Time();
+
+                Log(StringFormat("Recovered active position tracker for ticket %d", g_pos_state.ticket));
+                break; // We only track one active trade
             }
-            g_pos_state.tp3 = tp3;
-            g_pos_state.atr_at_entry = g_current_atr > 0 ? g_current_atr : GetATR();
-            g_pos_state.open_time = (datetime)PositionGetInteger(POSITION_TIME);
-
-            Log(StringFormat("Recovered active position tracker for ticket %d", ticket));
-            break; // We only track one active trade
         }
     }
 
@@ -2070,8 +2191,6 @@ void OnDeinit(const int reason) {
     if (g_h_atr_ema != INVALID_HANDLE) IndicatorRelease(g_h_atr_ema);
     if (g_h_ema50_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema50_h1);
     if (g_h_ema200_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_h1);
-    if (g_h_ema50_m5 != INVALID_HANDLE) IndicatorRelease(g_h_ema50_m5);
-    if (g_h_ema200_m5 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_m5);
 
     Log(StringFormat("Nexubot deinitialized. Reason: %d", reason));
 }
