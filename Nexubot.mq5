@@ -47,7 +47,7 @@ input bool            InpSessionFilter     = true;   // Only trade during active
 input int             InpMaxSpreadPoints   = 500;     // Max allowed spread in points (0=off)
 input double          InpMinVolRatio       = 1.3;     // Min volume ratio for displacement
 input bool            InpRequirePOIConfluence = true; // Require setup to trigger near an active POI
-input double          InpPOIProximityATR   = 1.0;     // Max distance to POI (x ATR) for confluence
+input double          InpPOIProximityATR   = 2.0;     // Max distance to POI (x ATR) for confluence
 
 //--- ATR & Volatility
 input group           "==== ATR & VOLATILITY ===="
@@ -64,8 +64,8 @@ input group           "==== SMC STRUCTURE DETECTION ===="
 input int             InpPivotLookback     = 6;      // Pivot detection window (bars each side)
 input int             InpStructureLookback = 200;    // Structure detection depth (bars)
 input int             InpMajorSwingPeriod  = 50;     // Major swing lookback (bars)
-input int             InpSweepRecencyBars  = 12;     // Max bars since a Tier2+ sweep to remain "active"
-input int             InpBOSRecencyBars    = 15;     // Max bars since a BOS/CHoCH to remain "active"
+input int             InpSweepRecencyBars  = 48;     // Max bars since a Tier2+ sweep to remain "active"
+input int             InpBOSRecencyBars    = 24;     // Max bars since a BOS/CHoCH to remain "active"
 
 //--- POI (Point of Interest) Management
 input group           "==== POI MANAGEMENT ===="
@@ -2109,7 +2109,7 @@ int OnInit() {
 
     // ---- 1. Initialize indicator handles FIRST ----
     g_h_atr = iATR(_Symbol, PERIOD_M5, InpATRPeriod);
-    g_h_atr_ema = iMA(_Symbol, PERIOD_M5, InpATREMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    g_h_atr_ema = iMA(_Symbol, PERIOD_M5, InpATREMAPeriod, 0, MODE_EMA, g_h_atr);
     g_h_ema50_h1 = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE);
     g_h_ema200_h1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
 
