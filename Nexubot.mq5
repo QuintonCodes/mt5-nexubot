@@ -14,7 +14,6 @@
 //|    2. Tier 2+ Liquidity Sweep  (Daily/Asian or Major 50-bar)    |
 //|    3. BOS / CHoCH Confirmation (close-based, no wicks)           |
 //|    4. Minimum 2:1 R/R Ratio    (structural, pre-execution)       |
-//|    5. Confluence Score >= 65   (composite rule-based scoring)    |
 //+------------------------------------------------------------------+
 
 #property copyright "Nexubot Systems © 2026"
@@ -34,14 +33,14 @@
 //--- Risk Management
 input group           "==== RISK MANAGEMENT ===="
 input double          InpRiskPercent       = 2.0;    // Risk per trade (% of balance)
-input double          InpMaxLotSize        = 5.0;    // Hard cap on lot size
-input double          InpMinRR             = 1.5;    // Min structural R/R before entry
+input double          InpMaxLotSize        = 1.0;    // Hard cap on lot size
+input double          InpMinRR             = 2.0;    // Min structural R/R before entry
 input bool            InpUseDynamicRisk    = true;   // Scale risk by account size tiers
 
 //--- Entry Filters (The Strict Funnel)
 input group           "==== ENTRY SIGNAL FILTERS ===="
-input int             InpMinSweepTier      = 0;      // Min liquidity sweep tier (1/2/3)
-input bool            InpRequireHTFAlign   = false;   // Require H1 trend aligned to signal
+input int             InpMinSweepTier      = 2;      // Min liquidity sweep tier (1/2/3)
+input bool            InpRequireHTFAlign   = true;   // Require H1 trend aligned to signal
 input bool            InpRequireBOS        = true;   // Require BOS or CHoCH confirmation
 input bool            InpSessionFilter     = true;   // Only trade during active killzones
 input int             InpMaxSpreadPoints   = 400;     // Max allowed spread in points (0=off)
@@ -96,7 +95,6 @@ input bool            InpEnableAlerts      = true;   // Enable MT5 popup alerts
 input bool            InpEnableNotify      = true;   // Enable mobile push notifications
 input bool            InpVerboseLog        = true;  // Print verbose debug logs
 input ulong           InpMagicNumber       = 20260611; // EA magic number (unique per chart)
-
 
 //==========================================================================
 //  SECTION 2: CONSTANTS
@@ -201,11 +199,11 @@ struct SSessionInfo {
 //  All mutable runtime state. Only modified within specific functions.
 //==========================================================================
 
-//--- Trading engine objects
+// --- Trading engine objects ---
 CTrade g_trade;
 CPositionInfo g_position_info;
 
-//--- Indicator handles (initialized once in OnInit, released in OnDeinit)
+// --- Indicator handles (initialized once in OnInit, released in OnDeinit) ---
 int g_h_atr = INVALID_HANDLE; // ATR(14) on M5
 int g_h_atr_ema = INVALID_HANDLE; // ATR EMA on M5 (expansion ratio baseline)
 int g_h_ema50_h1 = INVALID_HANDLE; // EMA(50) on H1 for HTF trend
@@ -213,7 +211,7 @@ int g_h_ema200_h1 = INVALID_HANDLE; // EMA(200) on H1 for HTF trend
 int g_h_ema50_m5 = INVALID_HANDLE; // EMA(50) on M5 for local structure
 int g_h_ema200_m5 = INVALID_HANDLE; // EMA(200) on M5 for local structure
 
-//--- POI arrays — fixed-size with active count trackers
+// --- POI arrays — fixed-size with active count trackers ---
 SZone g_fvgs[MAX_ZONES];
 SZone g_ifvgs[MAX_ZONES];
 SZone g_obs[MAX_ZONES];
@@ -221,7 +219,7 @@ int g_fvg_count = 0;
 int g_ifvg_count = 0;
 int g_ob_count = 0;
 
-//--- Structural context — updated on each new bar
+// --- Structural context — updated on each new bar ---
 SStructureInfo g_structure;
 double g_htf_trend = 0.0; // 1.0=bull, -1.0=bear, 0.0=flat (H1)
 double g_current_atr = 0.0; // Last confirmed bar's ATR
@@ -231,16 +229,16 @@ double g_pdl = 0.0; // Previous day's low
 double g_asian_high = 0.0; // Current day's Asian session high
 double g_asian_low = 0.0; // Current day's Asian session low
 
-//--- Position tracking
+// --- Position tracking ---
 SPositionState g_pos_state;
 
-//--- Bar timing — used to detect when a new M5 bar has formed
+// --- Bar timing — used to detect when a new M5 bar has formed ---
 datetime g_last_bar_time = 0;
 
-//--- State tracking for log throttling
+// --- State tracking for log throttling ---
 string g_last_skip_reason = "";
 
-//--- Cooldown / throttle
+// --- Cooldown / throttle ---
 datetime g_last_signal_time = 0;
 int g_bars_since_last_signal = 0;
 int g_bars_since_sweep = 9999; // Bars elapsed since the last Tier2+ sweep
@@ -249,7 +247,7 @@ int g_recent_sweep_dir = -1; // Direction of the most recent sweep (ZONE_BULL/ZO
 int g_bars_since_break = 9999; // Bars elapsed since the last BOS/CHoCH
 int g_recent_break_dir = STRUCT_FLAT; // Direction of that most recent break
 
-//--- Volatile asset identifier suffixes
+// --- Volatile asset identifier suffixes ---
 string g_volatile_ids[] = {"XAU", "XAG", "BTC", "ETH", "US30", "NAS", "SPX", "UK100", "GER40"};
 
 //==========================================================================
@@ -490,8 +488,10 @@ double GetRecentLow(const MqlRates &rates[], int start, int n_bars) {
 double GetRecentHigh(const MqlRates &rates[], int start, int n_bars) {
     int total = ArraySize(rates);
     double hi = 0.0;
+
     for (int i = start; i < MathMin(start + n_bars, total); i++)
         hi = MathMax(hi, rates[i].high);
+
     return hi;
 }
 
@@ -783,11 +783,11 @@ void AddZone(SZone &zones[], int &count, const SZone &new_zone) {
 
 /// @brief Core incremental POI update step.
 /// Processes one bar triplet (c1, c2, curr) to:
-///   1. Age all existing zones by 1 bar.
-///   2. Detect new FVG/OB zones from the c2 displacement candle.
-///   3. Convert breached FVGs to IFVGs.
-///   4. Track mitigations and invalidate exhausted zones.
-///   5. Convert breached OBs to Breaker Blocks.
+/// 1. Age all existing zones by 1 bar.
+/// 2. Detect new FVG/OB zones from the c2 displacement candle.
+/// 3. Convert breached FVGs to IFVGs.
+/// 4. Track mitigations and invalidate exhausted zones.
+/// 5. Convert breached OBs to Breaker Blocks.
 /// @param c1 Oldest bar in triplet (rates[k+2]).
 /// @param c2 Middle / displacement bar (rates[k+1]).
 /// @param curr Newest bar (rates[k]).
@@ -808,7 +808,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
         if (!g_fvgs[i].active) continue;
         if (g_fvgs[i].zone_type == ZONE_BULL && curr_close < g_fvgs[i].zone_low) {
             // Bull FVG was closed through → becomes Bear IFVG
-            SZone ifvg; ZeroMemory(ifvg);
+            SZone ifvg;
+            ZeroMemory(ifvg);
             ifvg.active = true;
             ifvg.zone_type = ZONE_BEAR;
             ifvg.zone_high = g_fvgs[i].zone_high;
@@ -817,7 +818,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
             g_fvgs[i].active = false;
         } else if (g_fvgs[i].zone_type == ZONE_BEAR && curr_close > g_fvgs[i].zone_high) {
             // Bear FVG was closed through → becomes Bull IFVG
-            SZone ifvg; ZeroMemory(ifvg);
+            SZone ifvg;
+            ZeroMemory(ifvg);
             ifvg.active = true;
             ifvg.zone_type = ZONE_BULL;
             ifvg.zone_high = g_fvgs[i].zone_high;
@@ -901,7 +903,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
     if (c2_vol_ratio >= InpMinFVGVolRatio && c2_body_ratio >= 0.65) {
         // Bull FVG: gap between c1.high and curr.low, c2 is bullish displacement
         if (c1.high < curr.low && c2.close > c2.open) {
-            SZone fvg; ZeroMemory(fvg);
+            SZone fvg;
+            ZeroMemory(fvg);
             fvg.active = true;
             fvg.zone_type = ZONE_BULL;
             fvg.zone_high = curr.low;
@@ -911,7 +914,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
         }
         // Bear FVG: gap between curr.high and c1.low, c2 is bearish displacement
         else if (c1.low > curr.high && c2.close < c2.open) {
-            SZone fvg; ZeroMemory(fvg);
+            SZone fvg;
+            ZeroMemory(fvg);
             fvg.active = true;
             fvg.zone_type = ZONE_BEAR;
             fvg.zone_high = c1.low;
@@ -927,7 +931,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
     // Bull OB: c2 is bullish, c1 was bearish, c2 closes above c1.high (engulf)
     if (c2.close > c2.open && c1.close < c1.open &&
         c2.close > c1.high && c2_vol_ratio >= InpMinOBVolRatio) {
-        SZone ob; ZeroMemory(ob);
+        SZone ob;
+        ZeroMemory(ob);
         ob.active = true;
         ob.zone_type = ZONE_BULL;
         ob.zone_high = c1.high;
@@ -939,7 +944,8 @@ void UpdatePOIsIncremental(const MqlRates &c1, const MqlRates &c2,
     // Bear OB: c2 is bearish, c1 was bullish, c2 closes below c1.low (engulf)
     else if (c2.close < c2.open && c1.close > c1.open &&
              c2.close < c1.low && c2_vol_ratio >= InpMinOBVolRatio) {
-        SZone ob; ZeroMemory(ob);
+        SZone ob;
+        ZeroMemory(ob);
         ob.active = true;
         ob.zone_type = ZONE_BEAR;
         ob.zone_high = c1.high;
@@ -994,6 +1000,7 @@ bool HasActiveBullPOI(double close_price, double atr, double proximity = 0.5) {
         double dist = MathAbs(close_price - g_fvgs[i].zone_high);
         if (dist <= atr * proximity) return true;
     }
+
     // Check OBs
     for (int i = 0; i < g_ob_count; i++) {
         if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BULL) continue;
@@ -1001,6 +1008,7 @@ bool HasActiveBullPOI(double close_price, double atr, double proximity = 0.5) {
         double dist = MathAbs(close_price - g_obs[i].zone_high);
         if (dist <= atr * proximity) return true;
     }
+
     return false;
 }
 
@@ -1012,12 +1020,14 @@ bool HasActiveBearPOI(double close_price, double atr, double proximity = 0.5) {
         double dist = MathAbs(close_price - g_fvgs[i].zone_low);
         if (dist <= atr * proximity) return true;
     }
+
     for (int i = 0; i < g_ob_count; i++) {
         if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BEAR) continue;
         if (g_obs[i].mitigations >= InpMaxMitigations) continue;
         double dist = MathAbs(close_price - g_obs[i].zone_low);
         if (dist <= atr * proximity) return true;
     }
+
     return false;
 }
 
@@ -1038,6 +1048,7 @@ double GetNearestOpposingPOI(int direction, double entry) {
                     nearest = g_ifvgs[i].zone_low;
             }
         }
+
         for (int i = 0; i < g_ob_count; i++) {
             if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BEAR) continue;
             if (g_obs[i].ob_tier != OB_MAJOR && g_obs[i].ob_tier != OB_BREAKER) continue;
@@ -1055,6 +1066,7 @@ double GetNearestOpposingPOI(int direction, double entry) {
                     nearest = g_ifvgs[i].zone_high;
             }
         }
+
         for (int i = 0; i < g_ob_count; i++) {
             if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BULL) continue;
             if (g_obs[i].ob_tier != OB_MAJOR && g_obs[i].ob_tier != OB_BREAKER) continue;
@@ -1262,6 +1274,7 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
             }
         }
     }
+
     return sig;
 }
 
@@ -1301,6 +1314,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 return sig;
             }
         }
+
         // FVG bounce
         for (int i = 0; i < g_fvg_count; i++) {
             if (!g_fvgs[i].active || g_fvgs[i].zone_type != ZONE_BULL) continue;
@@ -1333,6 +1347,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 return sig;
             }
         }
+
         // FVG rejection
         for (int i = 0; i < g_fvg_count; i++) {
             if (!g_fvgs[i].active || g_fvgs[i].zone_type != ZONE_BEAR) continue;
@@ -1593,7 +1608,7 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
     // Validate minimum R/R after structural capping
     double rr = (sl_dist > 0) ? (actual_tp_dist / sl_dist) : 0.0;
     if (rr < InpMinRR) {
-        Log(StringFormat("R/R too low (%.2f < %.2f). Skipping.", rr, InpMinRR), true);
+        PrintThrottledSkipReason(StringFormat("R/R too low (%.2f < %.2f). Skipping.", rr, InpMinRR));
         return false;
     }
 
@@ -1732,8 +1747,8 @@ void ManagePosition() {
     // ---- Timeout logging (not forced close — let the TP/SL work) ----
     int mins_elapsed = (int)((TimeCurrent() - g_pos_state.open_time) / 60);
     if (mins_elapsed > InpMaxTradeMins && !g_pos_state.be_set) {
-        Log(StringFormat("Trade on %s exceeded %d mins. SL/TP still active.",
-                         _Symbol, InpMaxTradeMins), true);
+        PrintThrottledSkipReason(StringFormat("Trade on %s exceeded %d mins. SL/TP still active.",
+                         _Symbol, InpMaxTradeMins));
     }
 
     // Current bid/ask
@@ -2063,8 +2078,8 @@ void OnDeinit(const int reason) {
 
 /// @brief Main execution handler. Runs on every tick received from the broker.
 /// Structure:
-///   1. Position management (every tick — for TP1/TP2 detection precision)
-///   2. New bar detection — runs full market analysis on confirmed M5 bar close
+/// 1. Position management (every tick — for TP1/TP2 detection precision)
+/// 2. New bar detection — runs full market analysis on confirmed M5 bar close
 void OnTick() {
     // ---- 1. Manage open position on EVERY tick (highest priority) ----
     // This ensures we don't miss a TP1/TP2 level hit mid-bar
