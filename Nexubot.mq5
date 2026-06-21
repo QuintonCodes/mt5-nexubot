@@ -37,6 +37,8 @@ input double          InpMaxLotSize        = 1.0;    // Hard cap on lot size
 input double          InpMinRR             = 2.0;    // Min structural R/R before entry
 input double          InpMaxRR             = 4.0;    // Hard cap on structural R/R to prevent over-extension
 input bool            InpUseDynamicRisk    = true;   // Scale risk by account size tiers
+input int             InpMaxLossStreak     = 3;      // Net loss count before risk is throttled
+input double          InpStreakPenaltyMult = 0.5;    // Risk multiplier applied exponentially per loss beyond the threshold
 
 //--- Entry Filters (The Strict Funnel)
 input group           "==== ENTRY SIGNAL FILTERS ===="
@@ -53,7 +55,8 @@ input double          InpPOIProximityATR   = 2.0;     // Max distance to POI (x 
 input group           "==== ATR & VOLATILITY ===="
 input int             InpATRPeriod         = 14;     // ATR calculation period
 input int             InpATREMAPeriod      = 48;     // ATR EMA period (expansion baseline)
-input double          InpMinVolExpansion   = 0.85;   // Min ATR expansion ratio to permit trades
+input double          InpMinVolExpansion   = 0.85;   // Optimal ATR expansion ratio (full risk)
+input double          InpMinVolFloor       = 0.70;   // Absolute minimum expansion ratio (scaled risk floor)
 input double          InpSLMultiplierBase  = 1.0;    // Base SL ATR multiplier
 input double          InpSLMultiplierHVol  = 1.3;    // SL ATR multiplier for volatile assets
 input double          InpMaxSLCapATR       = 3.5;    // Max SL cap (x ATR) — hard ceiling
@@ -61,6 +64,7 @@ input double          InpTPMultiplier      = 4.0;    // Base TP ATR multiplier
 
 //--- SMC Structure Settings
 input group           "==== SMC STRUCTURE DETECTION ===="
+input double          InpSweepSLBufferATR  = 0.40;   // Stop loss buffer for liquidity sweep entries (x ATR)
 input int             InpPivotLookback     = 6;      // Pivot detection window (bars each side)
 input int             InpStructureLookback = 200;    // Structure detection depth (bars)
 input int             InpMajorSwingPeriod  = 50;     // Major swing lookback (bars)
@@ -89,8 +93,9 @@ input int             InpNYEnd             = 23;     // New York session end hou
 
 //--- Multi-TP Exit Management
 input group           "==== MULTI-TP EXIT MANAGEMENT ===="
-input double          InpTP1Ratio          = 0.33;   // TP1 = % of full TP3 distance
-input double          InpTP2Ratio          = 0.66;   // TP2 = % of full TP3 distance
+input double          InpTP1Ratio          = 0.50;   // TP1 = % of full TP3 distance (Trigger for partial close)
+input double          InpTP1PartialVol     = 0.50;   // Percentage of original lot size to close at TP1
+input double          InpTP2Ratio          = 0.75;   // TP2 = % of full TP3 distance (Trigger for Breakeven move)
 input double          InpBEBufferATR       = 0.15;   // Breakeven buffer above entry (x ATR)
 input int             InpMaxTradeMins      = 240;    // Max trade duration (minutes)
 
@@ -144,7 +149,6 @@ struct SZone {
     int    age_bars;        // Bars since zone was created
     double vol_strength;    // Volume ratio at zone creation (for OBs)
     int    ob_tier;         // OB_INTERNAL, OB_MAJOR, OB_BREAKER
-    bool   is_pivot;        // Created at a confirmed structural pivot
 };
 
 /// @brief Summarizes current structural analysis for the M5 chart.
@@ -166,7 +170,6 @@ struct SSignal {
     int    direction;       // ZONE_BULL (long) or ZONE_BEAR (short)
     double suggested_sl;    // Strategy-supplied raw SL level
     string strategy_name;   // Human-readable strategy label
-    string order_type;      // "MARKET" or "LIMIT"
 };
 
 /// @brief Live state of a tracked open position.
@@ -175,6 +178,7 @@ struct SPositionState {
     ulong    ticket;            // MT5 position ticket
     bool     is_long;           // true=BUY, false=SELL
     double   entry_price;       // Price at which trade was entered
+    double   initial_volume;    // Volume at trade execution (for partial closes)
     double   current_sl;        // Current stop loss level (updates as trade progresses)
     double   tp1;               // First take-profit level (breakeven trigger)
     double   tp2;               // Second take-profit level (trail-to-TP1 trigger)
@@ -184,6 +188,19 @@ struct SPositionState {
     bool     be_set;            // Has stop been moved to breakeven or better?
     double   atr_at_entry;      // ATR value captured at entry (for BE calculation)
     datetime open_time;         // Time trade was opened (for timeout management)
+    string   strategy_name;     // The strategy that generated the trade (for analytics)
+    bool     timeout_logged;    // Has the timeout warning been logged?
+};
+
+/// @brief Container for tracking per-strategy performance.
+struct SStrategyStats {
+    string strategy_name;
+    int    total_trades;
+    int    long_trades;
+    int    long_wins;
+    int    short_trades;
+    int    short_wins;
+    double net_profit;
 };
 
 /// @brief Session activity context for current time.
@@ -230,15 +247,19 @@ double g_asian_low = 0.0; // Current day's Asian session low
 // --- Position tracking ---
 SPositionState g_pos_state;
 
+// --- Analytics tracking ---
+SStrategyStats g_strategy_stats[20];
+int g_stats_count = 0;
+
 // --- Bar timing — used to detect when a new M5 bar has formed ---
 datetime g_last_bar_time = 0;
 
 // --- State tracking for log throttling ---
 string g_last_skip_reason = "";
+string g_last_manage_reason = "";
 static datetime last_spread_log = 0;
 
 // --- Cooldown / throttle ---
-datetime g_last_signal_time = 0;
 int g_bars_since_last_signal = 9999;
 int g_bars_since_sweep = 9999; // Bars elapsed since the last Tier2+ sweep
 int g_recent_sweep_tier = SWEEP_NONE; // Tier of that most recent sweep
@@ -406,6 +427,14 @@ void PrintThrottledSkipReason(string reason) {
     if (reason != g_last_skip_reason) {
         Log(reason, true); // Uses your existing Log() function
         g_last_skip_reason = reason;
+    }
+}
+
+/// @brief Helper function to prevent log spam for consecutive identical trade management events
+void PrintThrottledManageLog(string msg) {
+    if (msg != g_last_manage_reason) {
+        Log(msg, true);
+        g_last_manage_reason = msg;
     }
 }
 
@@ -1181,21 +1210,19 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
     int req_sweep_dir = (bos_dir == STRUCT_BULL) ? ZONE_BULL : ZONE_BEAR;
     if (g_recent_sweep_dir != req_sweep_dir) return sig; // Reject conflicting signals
 
-    double atr_buf = atr * 0.2;
+    double atr_buf = atr * InpSweepSLBufferATR;
     string name = (g_recent_sweep_tier == SWEEP_DAILY) ? "Daily/Asian Sweep" : "Major Swing Sweep";
 
     if (bos_dir == STRUCT_BULL) {
         sig.valid = true;
         sig.direction = ZONE_BULL;
         sig.strategy_name = name;
-        sig.order_type = "MARKET";
         sig.suggested_sl = curr.low - atr_buf;
     }
     else if (bos_dir == STRUCT_BEAR) {
         sig.valid = true;
         sig.direction = ZONE_BEAR;
         sig.strategy_name = name;
-        sig.order_type = "MARKET";
         sig.suggested_sl = curr.high + atr_buf;
     }
 
@@ -1239,7 +1266,6 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
             sig.valid = true;
             sig.direction = ZONE_BULL;
             sig.strategy_name = "ICT OTE (Bullish)";
-            sig.order_type = "MARKET";
             sig.suggested_sl = g_structure.last_low - atr_buf;
         }
     }
@@ -1252,7 +1278,6 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
             sig.valid = true;
             sig.direction = ZONE_BEAR;
             sig.strategy_name = "ICT OTE (Bearish)";
-            sig.order_type = "MARKET";
             sig.suggested_sl = g_structure.last_high + atr_buf;
         }
     }
@@ -1274,7 +1299,7 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
     bool bouncing_down = close_price < curr.open;
     if (!bouncing_up && !bouncing_down) return sig;
 
-    double atr_buf = atr * 0.5;
+    double atr_buf = atr * 0.2;
 
     if (bouncing_up) {
         // Check if price is bouncing off a BULL IFVG (former resistance acting as support)
@@ -1287,8 +1312,10 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BULL;
                 sig.strategy_name = "IFVG Re-Test";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.low - atr_buf;
+
+                // Anchor the SL behind the entire IFVG zone, not just the single candle wick
+                double sl_anchor = MathMin(curr.low, g_ifvgs[i].zone_low);
+                sig.suggested_sl = sl_anchor - atr_buf;
                 return sig;
             }
         }
@@ -1304,8 +1331,10 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BEAR;
                 sig.strategy_name = "IFVG Re-Test";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.high + atr_buf;
+
+                // Anchor the SL above the entire IFVG zone
+                double sl_anchor = MathMax(curr.high, g_ifvgs[i].zone_high);
+                sig.suggested_sl = sl_anchor + atr_buf;
                 return sig;
             }
         }
@@ -1332,7 +1361,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
     bool bouncing_down = close_price < curr.open;
     if (!bouncing_up && !bouncing_down) return sig;
 
-    double atr_buf = atr * 0.5;
+    double atr_buf = atr * 0.2;
 
     if (bouncing_up && g_recent_sweep_dir == ZONE_BULL) {
         // Bullish: OB bounce
@@ -1345,8 +1374,10 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BULL;
                 sig.strategy_name = tier_name + " OB CE Bounce";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.low - atr_buf;
+
+                // Anchor the SL behind the entire Order Block zone
+                double sl_anchor = MathMin(curr.low, g_obs[i].zone_low);
+                sig.suggested_sl = sl_anchor - atr_buf;
                 return sig;
             }
         }
@@ -1360,8 +1391,10 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BULL;
                 sig.strategy_name = "FVG Bounce";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.low - atr_buf;
+
+                // Anchor the SL behind the entire Fair Value Gap zone
+                double sl_anchor = MathMin(curr.low, g_fvgs[i].zone_low);
+                sig.suggested_sl = sl_anchor - atr_buf;
                 return sig;
             }
         }
@@ -1378,8 +1411,10 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BEAR;
                 sig.strategy_name = tier_name + " OB CE Bounce";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.high + atr_buf;
+
+                // Anchor the SL above the entire Order Block zone
+                double sl_anchor = MathMax(curr.high, g_obs[i].zone_high);
+                sig.suggested_sl = sl_anchor + atr_buf;
                 return sig;
             }
         }
@@ -1393,12 +1428,15 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.valid = true;
                 sig.direction = ZONE_BEAR;
                 sig.strategy_name = "FVG Bounce";
-                sig.order_type = "MARKET";
-                sig.suggested_sl = curr.high + atr_buf;
+
+                // Anchor the SL above the entire Fair Value Gap zone
+                double sl_anchor = MathMax(curr.high, g_fvgs[i].zone_high);
+                sig.suggested_sl = sl_anchor + atr_buf;
                 return sig;
             }
         }
     }
+
     return sig;
 }
 
@@ -1433,7 +1471,6 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
         sig.valid = true;
         sig.direction = ZONE_BULL;
         sig.strategy_name = "VWAP Bounce";
-        sig.order_type = "MARKET";
         sig.suggested_sl = curr.low - atr_buf;
     }
 
@@ -1442,7 +1479,6 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
         sig.valid = true;
         sig.direction = ZONE_BEAR;
         sig.strategy_name = "VWAP Bounce";
-        sig.order_type = "MARKET";
         sig.suggested_sl = curr.high + atr_buf;
     }
 
@@ -1465,6 +1501,14 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
     double pd = g_structure.pd_array;
     bool allow_long = (pd <= 0.60); // Only long below equilibrium
     bool allow_short = (pd >= 0.40); // Only short above equilibrium
+
+    // ---- HTF Alignment Routing Guard ----
+    // Prevent the router from picking a counter-trend signal and discarding the bar.
+    // This ensures lower-priority, trend-aligned strategies get a chance to fire.
+    if (InpRequireHTFAlign) {
+        if (g_htf_trend != 1.0) allow_long = false;
+        if (g_htf_trend != -1.0) allow_short = false;
+    }
 
     SSignal sig;
 
@@ -1515,6 +1559,49 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
 //  SECTION 13: RISK MANAGEMENT
 //==========================================================================
 
+/// @brief Analyzes EA history to calculate a "Net Loss Counter" for gradual recovery.
+/// A loss adds +1. A win subtracts -1 (floored at 0).
+/// Scratch trades are ignored. This ensures risk restores gradually after a drawdown.
+/// @return Integer count of net losses, used to scale down risk for recovery.
+int GetNetLossCounter() {
+    int counter = 0;
+
+    // Request full history to ensure we can read past deals
+    if (HistorySelect(0, TimeCurrent())) {
+        int total = HistoryDealsTotal();
+
+        // Iterate forwards from oldest to newest to build the running state
+        for (int i = 0; i < total; i++) {
+            ulong ticket = HistoryDealGetTicket(i);
+            if (ticket > 0) {
+                // Ensure the deal belongs to this specific EA and Symbol
+                if (HistoryDealGetInteger(ticket, DEAL_MAGIC) == InpMagicNumber &&
+                    HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol) {
+
+                    long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+
+                    // We only care about OUT deals (when a position is closed)
+                    if (entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT) {
+                        // Calculate net profit including costs
+                        double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT) +
+                                        HistoryDealGetDouble(ticket, DEAL_SWAP) +
+                                        HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+
+                        // Ignore near-zero breakeven scratch trades (e.g. within $0.50 of 0)
+                        if (profit < -0.5) {
+                            counter++;
+                        } else if (profit > 0.5) {
+                            counter--;
+                            if (counter < 0) counter = 0; // Floor at 0
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return counter;
+}
+
 /// @brief Returns the maximum allowed risk percentage based on account
 /// size and currency
 /// @param balance Current account balance.
@@ -1553,6 +1640,24 @@ double CalculateLotSize(double entry_price, double sl_price, ENUM_ORDER_TYPE ord
 
     // --- Dynamic Risk Tiering Integration ---
     double applied_risk_pct = GetRiskCap(balance, currency);
+
+    // --- Drawdown & Streak Penalty Integration ---
+    int net_loss_count = GetNetLossCounter();
+
+    if (net_loss_count >= InpMaxLossStreak) {
+        // Calculate how deep we are into the streak.
+        // e.g., if threshold is 3, and we have 4 losses: depth = 2.
+        // Penalty = 0.5 ^ 2 = 0.25 (Quarter risk). This cuts risk exponentially.
+        int depth = (net_loss_count - InpMaxLossStreak) + 1;
+        double penalty = MathPow(InpStreakPenaltyMult, depth);
+
+        // Enforce a hard floor (10% of original risk) so we don't calculate invalid micro-lots
+        penalty = MathMax(penalty, 0.1);
+
+        applied_risk_pct *= penalty;
+        Log(StringFormat("⚠️ Net loss counter at %d. Risk throttled by %.0f%% to %.2f%%",
+            net_loss_count, (1.0 - penalty) * 100.0, applied_risk_pct), true);
+    }
 
     // Scale the baseline risk capital by the session's confidence modifier
     double risk_amount = balance * (applied_risk_pct / 100.0) * session_multiplier;
@@ -1620,7 +1725,8 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
     // Override with strategy-suggested SL if it falls within acceptable bounds
     if (signal.suggested_sl > 0) {
         double suggested_dist = MathAbs(signal.suggested_sl - entry);
-        if (suggested_dist > atr * 0.2 && suggested_dist < atr * 6.0) {
+
+        if (suggested_dist > atr * 0.35 && suggested_dist < atr * 6.0) {
             // Validate correct side of entry
             bool correct_side = (is_long  && signal.suggested_sl < entry) ||
                                 (!is_long && signal.suggested_sl > entry);
@@ -1637,7 +1743,7 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
 
     // Hard SL cap — prevents overly wide stops destroying R/R
     if (sl_dist > atr * InpMaxSLCapATR) {
-        Log(StringFormat("SL cap exceeded (%.5f > %.5f). Skipping.", sl_dist, atr * InpMaxSLCapATR), true);
+        PrintThrottledSkipReason("SL cap exceeded. Skipping.");
         return false;
     }
 
@@ -1668,13 +1774,13 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
         actual_tp_dist = sl_dist * InpMaxRR; // Clamp distance to Max RR
         tp3_price = is_long ? (entry + actual_tp_dist) : (entry - actual_tp_dist);
 
-        PrintThrottledSkipReason(StringFormat("Extreme RR normalized. Clamped from %.2f to %.2f", current_rr, InpMaxRR));
+        Log("Extreme RR normalized. Clamped to MaxRR.", true);
         current_rr = InpMaxRR; // Sync current_rr for the MinRR check below
     }
 
     // --- UNIFIED LOGIC: Minimum R/R Validation ---
     if (current_rr < InpMinRR) {
-        PrintThrottledSkipReason(StringFormat("R/R too low (%.2f < %.2f). Skipping.", current_rr, InpMinRR));
+        PrintThrottledSkipReason("R/R too low. Skipping.");
         return false;
     }
 
@@ -1735,6 +1841,7 @@ bool ExecuteTrade(const SSignal &signal, double sl, double tp1, double tp2,
     g_pos_state.ticket = ticket;
     g_pos_state.is_long = is_long;
     g_pos_state.entry_price = entry;
+    g_pos_state.initial_volume = lots;
     g_pos_state.current_sl = sl;
     g_pos_state.tp1 = NormalizeDouble(tp1, digits);
     g_pos_state.tp2 = NormalizeDouble(tp2, digits);
@@ -1744,6 +1851,7 @@ bool ExecuteTrade(const SSignal &signal, double sl, double tp1, double tp2,
     g_pos_state.be_set = false;
     g_pos_state.atr_at_entry = atr;
     g_pos_state.open_time = TimeCurrent();
+    g_pos_state.strategy_name = signal.strategy_name;
 
     // Announce trade
     string msg = StringFormat(
@@ -1776,6 +1884,21 @@ bool IsPositionOpen() {
 /// @param new_sl New stop loss price.
 /// @return true if modification succeeded.
 bool ModifyStopLoss(double new_sl) {
+    // ---- Advanced Fix: Market Closed & Throttle Guard ----
+    static datetime last_modify_attempt = 0;
+    datetime current_time = TimeCurrent();
+
+    // Throttle: If the last attempt failed, wait 10 seconds before retrying
+    if (current_time - last_modify_attempt < 10) return false;
+
+    // Check if trading is currently permitted for the symbol (guards against index rollover breaks)
+    ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+    if (trade_mode == SYMBOL_TRADE_MODE_DISABLED || trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY) {
+        last_modify_attempt = current_time; // Trigger throttle
+        PrintThrottledManageLog(StringFormat("Modify SL aborted: %s is currently closed for trading.", _Symbol));
+        return false;
+    }
+
     if (!g_position_info.SelectByTicket(g_pos_state.ticket)) return false;
 
     int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -1791,6 +1914,11 @@ bool ModifyStopLoss(double new_sl) {
     if (ok) {
         g_pos_state.current_sl = new_sl;
         Log(StringFormat("SL updated for %s: %.5f → %.5f", _Symbol, curr_sl, new_sl), true);
+        last_modify_attempt = 0; // Reset throttle on success
+        g_last_manage_reason = "";
+    } else {
+        last_modify_attempt = current_time; // Activate throttle on failure
+        PrintThrottledManageLog(StringFormat("Modify SL failed: %d", g_trade.ResultRetcode()));
     }
 
     return ok;
@@ -1806,18 +1934,21 @@ void ManagePosition() {
     if (!IsPositionOpen()) {
         // Position was closed (TP, SL, or manual close) — reset state
         if (g_pos_state.active) {
-            Log(StringFormat("Position %d closed.", g_pos_state.ticket));
+            double profit = GetPositionProfit(g_pos_state.ticket);
+            UpdateStrategyStats(g_pos_state.strategy_name, profit, g_pos_state.is_long);
+            Log(StringFormat("Position %d closed. Net Profit: %.2f", g_pos_state.ticket, profit));
             ZeroMemory(g_pos_state);
             g_pos_state.active = false;
         }
+
         return;
     }
 
     // ---- Timeout logging (not forced close — let the TP/SL work) ----
     int mins_elapsed = (int)((TimeCurrent() - g_pos_state.open_time) / 60);
-    if (mins_elapsed > InpMaxTradeMins && !g_pos_state.be_set) {
-        PrintThrottledSkipReason(StringFormat("Trade on %s exceeded %d mins. SL/TP still active.",
-                         _Symbol, InpMaxTradeMins));
+    if (mins_elapsed > InpMaxTradeMins && !g_pos_state.be_set && !g_pos_state.timeout_logged) {
+        Log(StringFormat("Trade on %s exceeded %d mins. SL/TP still active.", _Symbol, InpMaxTradeMins), true);
+        g_pos_state.timeout_logged = true; // Mark as logged to permanently silence for this position
     }
 
     // Current bid/ask
@@ -1833,7 +1964,51 @@ void ManagePosition() {
                                             : (curr_price <= g_pos_state.tp1);
 
         if (hit_tp1) {
-            // BE price = entry + ATR buffer (long) or entry - ATR buffer (short)
+            // ---- Advanced Fix: TP1 Throttle Guard ----
+            static datetime last_tp1_attempt = 0;
+            datetime current_time = TimeCurrent();
+            if (current_time - last_tp1_attempt < 10) return; // 10-second cooldown
+
+            ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+            if (trade_mode == SYMBOL_TRADE_MODE_DISABLED || trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY) {
+                last_tp1_attempt = current_time; // Trigger throttle
+                PrintThrottledManageLog(StringFormat("TP1 Partial Close aborted: %s is currently closed.", _Symbol));
+                return;
+            }
+
+            double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+            double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+            // Calculate lots to close, normalized to broker step sizes
+            double lots_to_close = MathFloor((g_pos_state.initial_volume * InpTP1PartialVol) / step) * step;
+
+            if (lots_to_close >= min_lot) {
+                if (g_trade.PositionClosePartial(g_pos_state.ticket, lots_to_close)) {
+                    g_pos_state.tp1_hit = true; // State is only updated upon broker success
+                    string msg = StringFormat("💰 %s TP1 Hit! Closed %.2f lots to secure profit. SL remains intact.", _Symbol, lots_to_close);
+                    Log(msg);
+                    if (InpEnableAlerts) Alert(msg);
+                    if (InpEnableNotify) SendNotification(msg);
+                    last_tp1_attempt = 0; // Reset throttle on success
+                    g_last_manage_reason = "";
+                } else {
+                    last_tp1_attempt = current_time; // Activate throttle on failure
+                    PrintThrottledManageLog(StringFormat("Failed to partially close position at TP1: %d", g_trade.ResultRetcode()));
+                }
+            } else {
+                // Initial volume was too small to partial close, simply skip and mark as hit
+                g_pos_state.tp1_hit = true;
+            }
+        }
+    }
+
+    // ---- TP2: Move SL to Breakeven (Capital Protection) ----
+    // Triggered only after price has pushed significantly toward TP3 (clearing the pullback zone)
+    if (g_pos_state.tp1_hit && !g_pos_state.tp2_hit) {
+        bool hit_tp2 = g_pos_state.is_long ? (curr_price >= g_pos_state.tp2)
+                                            : (curr_price <= g_pos_state.tp2);
+
+        if (hit_tp2) {
             double be_price;
             if (g_pos_state.is_long)
                 be_price = g_pos_state.entry_price + g_pos_state.atr_at_entry * InpBEBufferATR;
@@ -1843,27 +2018,9 @@ void ManagePosition() {
             be_price = NormalizeDouble(be_price, digits);
 
             if (ModifyStopLoss(be_price)) {
-                g_pos_state.tp1_hit = true; // State is only updated upon broker success
+                g_pos_state.tp2_hit = true;
                 g_pos_state.be_set = true;
-                string msg = StringFormat("🎯 %s TP1 Hit! SL moved to Breakeven: %.5f", _Symbol, be_price);
-                Log(msg);
-                if (InpEnableAlerts) Alert(msg);
-                if (InpEnableNotify) SendNotification(msg);
-            }
-        }
-    }
-
-    // ---- TP2: Trail SL to TP1 (lock in momentum profit) ----
-    if (g_pos_state.tp1_hit && !g_pos_state.tp2_hit) {
-        bool hit_tp2 = g_pos_state.is_long ? (curr_price >= g_pos_state.tp2)
-                                            : (curr_price <= g_pos_state.tp2);
-
-        if (hit_tp2) {
-            double trail_sl = NormalizeDouble(g_pos_state.tp1, digits);
-
-            if (ModifyStopLoss(trail_sl)) {
-                g_pos_state.tp2_hit = true; // State is only updated upon broker success
-                string msg = StringFormat("🎯 %s TP2 Hit! Trailing SL to TP1: %.5f", _Symbol, trail_sl);
+                string msg = StringFormat("🛡️ %s TP2 Hit! SL moved to Breakeven: %.5f", _Symbol, be_price);
                 Log(msg);
                 if (InpEnableAlerts) Alert(msg);
                 if (InpEnableNotify) SendNotification(msg);
@@ -1922,8 +2079,7 @@ void RunMarketAnalysis() {
 
     // ---- Guard: Signal Cooldown ----
     if (InpSignalCooldownBars > 0 && g_bars_since_last_signal < InpSignalCooldownBars) {
-        PrintThrottledSkipReason(StringFormat("Cooldown active (%d/%d bars). Scanning paused.",
-                                              g_bars_since_last_signal, InpSignalCooldownBars));
+        PrintThrottledSkipReason("Signal cooldown active. Scanning paused.");
         return;
     }
 
@@ -1950,10 +2106,23 @@ void RunMarketAnalysis() {
 
     // ---- Guard: Volatility Expansion Filter ----
     double atr_expansion = GetATRExpansionRatio();
-    if (atr_expansion < InpMinVolExpansion) {
-        PrintThrottledSkipReason(StringFormat("Volatility contracting (Ratio: %.2f < %.2f). Scanning paused.",
-                                              atr_expansion, InpMinVolExpansion));
+
+    // 1. Hard Floor: Throw away genuinely dead, untradeable markets
+    if (atr_expansion < InpMinVolFloor) {
+        PrintThrottledSkipReason("Volatility dead (Ratio < Floor). Scanning paused.");
         return;
+    }
+
+    // 2. Continuous Multiplier: For borderline markets, scale down risk instead of blocking the trade
+    if (atr_expansion < InpMinVolExpansion) {
+        // Scale linearly from 0.0 to 1.0 between Floor and Optimal threshold
+        double vol_confidence = (atr_expansion - InpMinVolFloor) / (InpMinVolExpansion - InpMinVolFloor);
+
+        // Clamp the penalty so we still allocate at least 25% of normal risk for valid setups
+        vol_confidence = MathMax(0.25, MathMin(1.0, vol_confidence));
+
+        // Apply the penalty to the session multiplier (which feeds directly into CalculateLotSize)
+        session.multiplier *= vol_confidence;
     }
 
     // ---- Update POIs incrementally from latest confirmed triplet ----
@@ -2035,18 +2204,6 @@ void RunMarketAnalysis() {
         }
     }
 
-    // ---- HTF alignment check against signal direction ----
-    if (InpRequireHTFAlign) {
-        if (signal.direction == ZONE_BULL && g_htf_trend != 1.0) {
-            Log("BUY signal rejected: H1 not bullish.", false);
-            return;
-        }
-        if (signal.direction == ZONE_BEAR && g_htf_trend != -1.0) {
-            Log("SELL signal rejected: H1 not bearish.", false);
-            return;
-        }
-    }
-
     // ---- Calculate entry, SL, TP levels (Condition 4: R/R >= InpMinRR) ----
     double entry = signal.direction == ZONE_BULL ?
                    SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
@@ -2056,9 +2213,6 @@ void RunMarketAnalysis() {
     if (!CalculateSLTP(signal, entry, g_current_atr, sl_price, tp1, tp2, tp3)) {
         return; // R/R or SL cap check failed inside CalculateSLTP
     }
-
-    // ---- Volume ratio for confluence scoring ----
-    double vol_ratio = (vol_sma > 0) ? ((double)rates[1].tick_volume / vol_sma) : 1.0;
 
     // ---- Calculate lot size ----
     double sl_dist = MathAbs(entry - sl_price);
@@ -2081,13 +2235,111 @@ void RunMarketAnalysis() {
 
     if (executed) {
         g_bars_since_last_signal = 0;
-        g_last_signal_time = TimeCurrent();
         g_last_skip_reason = ""; // Reset after a successful trade execution
     }
 }
 
 //==========================================================================
-//  SECTION 17: EA EVENT HANDLERS
+//  SECTION 17: ANALYTICS & EXPORT
+//==========================================================================
+
+/// @brief Calculates total net profit of a closed position including partials and fees.
+/// @param position_ticket Ticket number of the closed position.
+/// @return Total profit in account currency.
+double GetPositionProfit(ulong position_ticket) {
+    double total_profit = 0.0;
+
+    if (HistorySelectByPosition(position_ticket)) {
+        int deals = HistoryDealsTotal();
+        for (int i = 0; i < deals; i++) {
+            ulong deal_ticket = HistoryDealGetTicket(i);
+            long deal_entry = HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
+            if (deal_entry == DEAL_ENTRY_OUT || deal_entry == DEAL_ENTRY_INOUT) {
+                total_profit += HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+                total_profit += HistoryDealGetDouble(deal_ticket, DEAL_COMMISSION);
+                total_profit += HistoryDealGetDouble(deal_ticket, DEAL_SWAP);
+            }
+        }
+    }
+
+    return total_profit;
+}
+
+/// @brief Updates the performance record for a specific strategy.
+/// @param name Name of the strategy.
+/// @param profit Profit or loss from the closed trade.
+/// @param is_long True if it was a long trade, false if short.
+void UpdateStrategyStats(string name, double profit, bool is_long) {
+    int idx = -1;
+    for (int i = 0; i < g_stats_count; i++) {
+        if (g_strategy_stats[i].strategy_name == name) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx == -1) {
+        if (g_stats_count >= 20) return; // Prevent bounds overflow
+        idx = g_stats_count;
+        g_strategy_stats[idx].strategy_name = name;
+        g_strategy_stats[idx].total_trades = 0;
+        g_strategy_stats[idx].long_trades = 0;
+        g_strategy_stats[idx].long_wins = 0;
+        g_strategy_stats[idx].short_trades = 0;
+        g_strategy_stats[idx].short_wins = 0;
+        g_strategy_stats[idx].net_profit = 0.0;
+        g_stats_count++;
+    }
+
+    g_strategy_stats[idx].total_trades++;
+
+    // Route stats by direction, ignoring scratch trades near $0.00
+    if (is_long) {
+        g_strategy_stats[idx].long_trades++;
+        if (profit > 0.5) g_strategy_stats[idx].long_wins++;
+    } else {
+        g_strategy_stats[idx].short_trades++;
+        if (profit > 0.5) g_strategy_stats[idx].short_wins++;
+    }
+    g_strategy_stats[idx].net_profit += profit;
+}
+
+/// @brief Exports the accumulated strategy stats to a CSV file in the terminal's MQL5\Files directory.
+void ExportStrategyStats() {
+    if (g_stats_count == 0) return;
+    string filename = StringFormat("Nexubot_Stats_%s.csv", _Symbol);
+    int handle = FileOpen(filename, FILE_CSV | FILE_WRITE | FILE_ANSI, ',');
+
+    if (handle != INVALID_HANDLE) {
+        FileWrite(handle, "Strategy", "Total", "Longs", "Long Win%", "Shorts", "Short Win%", "Net Profit");
+        for (int i = 0; i < g_stats_count; i++) {
+            double win_rate = 0.0;
+
+            double long_wr = 0.0, short_wr = 0.0;
+
+            if (g_strategy_stats[i].long_trades > 0)
+                long_wr = ((double)g_strategy_stats[i].long_wins / g_strategy_stats[i].long_trades) * 100.0;
+
+            if (g_strategy_stats[i].short_trades > 0)
+                short_wr = ((double)g_strategy_stats[i].short_wins / g_strategy_stats[i].short_trades) * 100.0;
+
+            FileWrite(handle, g_strategy_stats[i].strategy_name,
+                              g_strategy_stats[i].total_trades,
+                              g_strategy_stats[i].long_trades,
+                              NormalizeDouble(long_wr, 2),
+                              g_strategy_stats[i].short_trades,
+                              NormalizeDouble(short_wr, 2),
+                              NormalizeDouble(g_strategy_stats[i].net_profit, 2));
+        }
+        FileClose(handle);
+        Log("Strategy stats exported to: " + filename);
+    } else {
+        Log("Failed to export strategy stats. Error: " + IntegerToString(GetLastError()));
+    }
+}
+
+//==========================================================================
+//  SECTION 18: EA EVENT HANDLERS
 //==========================================================================
 /// @brief Initializes all indicator handles, configures the trade engine,
 /// and warms up the POI state from historical data.
@@ -2173,6 +2425,14 @@ int OnInit() {
                 g_pos_state.atr_at_entry = g_current_atr > 0 ? g_current_atr : GetATR();
                 g_pos_state.open_time = g_position_info.Time();
 
+                // Extract strategy name from trade comment if possible
+                string comment = g_position_info.Comment();
+                if (StringFind(comment, "Nexubot|") == 0) {
+                    g_pos_state.strategy_name = StringSubstr(comment, 8);
+                } else {
+                    g_pos_state.strategy_name = "Unknown";
+                }
+
                 Log(StringFormat("Recovered active position tracker for ticket %d", g_pos_state.ticket));
                 break; // We only track one active trade
             }
@@ -2186,11 +2446,14 @@ int OnInit() {
 }
 
 /// @brief Releases all indicator handles and cleans up resources on EA removal.
+/// @param reason Reason code for deinitialization (e.g., user removal, chart close).
 void OnDeinit(const int reason) {
     if (g_h_atr != INVALID_HANDLE) IndicatorRelease(g_h_atr);
     if (g_h_atr_ema != INVALID_HANDLE) IndicatorRelease(g_h_atr_ema);
     if (g_h_ema50_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema50_h1);
     if (g_h_ema200_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_h1);
+
+    ExportStrategyStats();
 
     Log(StringFormat("Nexubot deinitialized. Reason: %d", reason));
 }
