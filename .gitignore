@@ -1,3 +1,30 @@
-.ex5
-.tmpl
+# Compiled MetaTrader Executables
+*.ex4
+*.ex5
+
+# MetaQuotes Editor / MetaEditor
 .meta/
+*.tmpl
+
+# Backtesting & Strategy Tester Logs
+*.log
+
+# EA Export Data & Optimization Files
+# (Prevents tracking exported stats like Nexubot_Stats_XAUUSDm.csv)
+*.csv
+*.set
+Tester/
+
+# Code Editor / IDE Configuration
+.vscode/
+.idea/
+*.swp
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

@@ -47,7 +47,7 @@ input bool            InpRequireHTFAlign   = true;   // Require H1 trend aligned
 input bool            InpRequireBOS        = true;   // Require BOS or CHoCH confirmation
 input bool            InpSessionFilter     = true;   // Only trade during active killzones
 input int             InpMaxSpreadPoints   = 500;     // Max allowed spread in points (0=off)
-input double          InpMinVolRatio       = 1.3;     // Min volume ratio for displacement
+input double          InpMinVolRatio       = 0.75;     // Min volume ratio for displacement
 input bool            InpRequirePOIConfluence = true; // Require setup to trigger near an active POI
 input double          InpPOIProximityATR   = 2.0;     // Max distance to POI (x ATR) for confluence
 
@@ -170,6 +170,7 @@ struct SSignal {
     int    direction;       // ZONE_BULL (long) or ZONE_BEAR (short)
     double suggested_sl;    // Strategy-supplied raw SL level
     string strategy_name;   // Human-readable strategy label
+    string diagnostic;      // Introspection reason for failure (for telemetry)
 };
 
 /// @brief Live state of a tracked open position.
@@ -208,7 +209,7 @@ struct SSessionInfo {
     bool   is_active;       // Is at least one session currently active?
     string session_name;    // "ASIAN", "LONDON", "NY", or "DEAD"
     double multiplier;      // Confidence multiplier for session quality
-    bool   is_london_open;  // True during London open (8-10 SAST) — highest sweep prob
+    bool   is_london_session;   // True during the entire London session
 };
 
 //==========================================================================
@@ -238,7 +239,6 @@ int g_ob_count = 0;
 SStructureInfo g_structure;
 double g_htf_trend = 0.0; // 1.0=bull, -1.0=bear, 0.0=flat (H1)
 double g_current_atr = 0.0; // Last confirmed bar's ATR
-double g_vwap = 0.0; // Session VWAP for the current day
 double g_pdh = 0.0; // Previous day's high
 double g_pdl = 0.0; // Previous day's low
 double g_asian_high = 0.0; // Current day's Asian session high
@@ -342,33 +342,6 @@ double GetHTFTrend() {
     if (ema50[0] > ema200[0]) return  1.0;
     if (ema50[0] < ema200[0]) return -1.0;
     return 0.0;
-}
-
-/// @brief Calculates the session VWAP by scanning today's M5 bars.
-/// Anchors to the start of the current server trading day.
-/// @param rates  Array of M5 bars (ArraySetAsSeries = true).
-/// @param total  Total bars in the rates array.
-/// @return VWAP price, or the last close if volume data is unavailable.
-double CalculateVWAP(const MqlRates &rates[], int total) {
-    if (total < 1) return rates[0].close;
-
-    double cum_pv = 0.0, cum_vol = 0.0;
-    MqlDateTime dt0;
-    TimeToStruct(rates[0].time, dt0); // Reference: today's date
-
-    for (int i = 0; i < total; i++) {
-        MqlDateTime dti;
-        TimeToStruct(rates[i].time, dti);
-
-        // Stop when we cross into the previous day
-        if (dti.day != dt0.day || dti.mon != dt0.mon) break;
-
-        double typical = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
-        cum_pv += typical * (double)rates[i].tick_volume;
-        cum_vol += (double)rates[i].tick_volume;
-    }
-
-    return (cum_vol > 0.0) ? (cum_pv / cum_vol) : rates[0].close;
 }
 
 /// @brief Calculates the 20-bar SMA of tick volume.
@@ -733,14 +706,16 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
         sweep_dir = ZONE_BEAR;
         return;
     }
-    // Restrict Asian range sweeps to the London Open killzone
-    if (session.is_london_open && g_asian_low > 0 && rec_lo5 < g_asian_low && close > g_asian_low) {
+
+    // Relax the London Open restriction to allow Asian range sweeps
+    // throughout the entire London session, significantly increasing trade frequency.
+    if (session.is_london_session && g_asian_low > 0 && rec_lo5 < g_asian_low && close > g_asian_low) {
         tier = SWEEP_DAILY;
         depth_atr = (g_asian_low - rec_lo5) / atr;
         sweep_dir = ZONE_BULL;
         return;
     }
-    if (session.is_london_open && g_asian_high > 0 && rec_hi5 > g_asian_high && close < g_asian_high) {
+    if (session.is_london_session && g_asian_high > 0 && rec_hi5 > g_asian_high && close < g_asian_high) {
         tier = SWEEP_DAILY;
         depth_atr = (rec_hi5 - g_asian_high) / atr;
         sweep_dir = ZONE_BEAR;
@@ -751,16 +726,24 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
     // TIER 2: Major 50-Period Swing Sweeps & Round Number Sweeps
     // -----------------------------------------------------------------------
     if (major_lo50 > 0 && rec_lo5 < major_lo50 && close > major_lo50) {
-        tier = SWEEP_MAJOR;
-        depth_atr = (major_lo50 - rec_lo5) / atr;
-        sweep_dir = ZONE_BULL;
-        return;
+        double depth = (major_lo50 - rec_lo5) / atr;
+        // Enforce meaningful sweep depth (filter out spread noise)
+        if (depth >= 0.15) {
+            tier = SWEEP_MAJOR;
+            depth_atr = depth;
+            sweep_dir = ZONE_BULL;
+            return;
+        }
     }
     if (major_hi50 > 0 && rec_hi5 > major_hi50 && close < major_hi50) {
-        tier = SWEEP_MAJOR;
-        depth_atr = (rec_hi5 - major_hi50) / atr;
-        sweep_dir = ZONE_BEAR;
-        return;
+        double depth = (rec_hi5 - major_hi50) / atr;
+        // Enforce meaningful sweep depth (filter out spread noise)
+        if (depth >= 0.15) {
+            tier = SWEEP_MAJOR;
+            depth_atr = depth;
+            sweep_dir = ZONE_BEAR;
+            return;
+        }
     }
     if (IsRoundNumberSweep(close, rec_hi5, rec_lo5, atr)) {
         tier = SWEEP_MAJOR;
@@ -1032,7 +1015,7 @@ void WarmupPOIs() {
         UpdatePOIsIncremental(rates[k + 2], rates[k + 1], rates[k], vol_sma_at_k);
     }
 
-    Log(StringFormat("[Nexubot] POI Warmup: FVGs=%d, IFVGs=%d, OBs=%d",
+    Log(StringFormat("POI Warmup: FVGs=%d, IFVGs=%d, OBs=%d",
               g_fvg_count, g_ifvg_count, g_ob_count));
 }
 
@@ -1161,7 +1144,7 @@ SSessionInfo GetSessionInfo() {
                  (h >= InpNYStart || h < InpNYEnd);
 
     info.is_active = is_asian || is_london || is_ny;
-    info.is_london_open = (h >= InpLondonStart && h < InpLondonStart + 3); // First 3hrs
+    info.is_london_session = is_london;
 
     if (is_ny) {
         info.session_name = "NY";
@@ -1199,18 +1182,38 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
     // Require a Tier2+ sweep within the recency window
-    if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
+    if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) {
+        sig.diagnostic = "No recent Tier2+ sweep";
+        return sig;
+    }
 
     // Require a BOS/CHoCH within the recency window — no direction filter yet,
     // direction alignment is enforced below.
     int bos_dir = g_recent_break_dir;
-    if (bos_dir == STRUCT_FLAT || g_bars_since_break > InpBOSRecencyBars) return sig;
+    if (bos_dir == STRUCT_FLAT || g_bars_since_break > InpBOSRecencyBars) {
+        sig.diagnostic = "No recent BOS";
+        return sig;
+    }
 
     // The sweep must align with the BOS direction
     int req_sweep_dir = (bos_dir == STRUCT_BULL) ? ZONE_BULL : ZONE_BEAR;
-    if (g_recent_sweep_dir != req_sweep_dir) return sig; // Reject conflicting signals
+    if (g_recent_sweep_dir != req_sweep_dir) {
+        sig.diagnostic = "Sweep direction mismatch";
+        return sig;
+    }
 
     double atr_buf = atr * InpSweepSLBufferATR;
+
+    // Identify high-noise session open bars (first 30 minutes of a killzone)
+    MqlDateTime dt;
+    TimeToStruct(curr.time, dt);
+    bool is_session_open = (dt.min < 30) && (dt.hour == InpAsianStart || dt.hour == InpLondonStart || dt.hour == InpNYStart);
+
+    // Dynamically widen the SL buffer to 0.60x ATR to survive session-open spread widening
+    if (g_recent_sweep_tier == SWEEP_MAJOR && is_session_open) {
+        atr_buf = atr * 0.60;
+    }
+
     string name = (g_recent_sweep_tier == SWEEP_DAILY) ? "Daily/Asian Sweep" : "Major Swing Sweep";
 
     if (bos_dir == STRUCT_BULL) {
@@ -1218,8 +1221,7 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
         sig.direction = ZONE_BULL;
         sig.strategy_name = name;
         sig.suggested_sl = curr.low - atr_buf;
-    }
-    else if (bos_dir == STRUCT_BEAR) {
+    } else if (bos_dir == STRUCT_BEAR) {
         sig.valid = true;
         sig.direction = ZONE_BEAR;
         sig.strategy_name = name;
@@ -1239,13 +1241,18 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
 SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
-    if (!g_structure.valid) return sig;
-    if (g_structure.last_high <= 0 || g_structure.last_low <= 0) return sig;
+    if (!g_structure.valid || g_structure.last_high <= 0 || g_structure.last_low <= 0) {
+        sig.diagnostic = "Structure invalid/no range";
+        return sig;
+    }
 
     double close_price = curr.close;
     double atr_buf = atr * 0.2;
     double range = g_structure.last_high - g_structure.last_low;
-    if (range <= 0) return sig;
+    if (range <= 0) {
+        sig.diagnostic = "Invalid structure range";
+        return sig;
+    }
 
     // Volume confirmation for OTE entries
     MqlRates rates_check[];
@@ -1256,17 +1263,28 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
         vol_sma = GetVolumeSMA(rates_check, 1, 20);
 
     double vol_ratio = (double)curr.tick_volume / vol_sma;
-    if (vol_ratio < InpMinVolRatio) return sig; // Require at least moderate volume
+
+    // Relaxed to 0.75 volume constraint. OTE pullbacks typically occur on lower volume.
+    if (vol_ratio < InpMinVolRatio) {
+        sig.diagnostic = "Volume too low for OTE bounce";
+        return sig;
+    }
 
     // Bullish OTE: Structure is BULL + H1 trending up → buy the dip to 62-79%
     if (g_structure.structure == STRUCT_BULL && g_htf_trend == 1.0) {
         double fib_62 = g_structure.last_high - range * 0.618;
         double fib_79 = g_structure.last_high - range * 0.786;
+        double fib_88 = g_structure.last_high - range * 0.886; // Proximate invalidation
+
         if (fib_79 <= close_price && close_price <= fib_62 && curr.close > curr.open) {
             sig.valid = true;
             sig.direction = ZONE_BULL;
             sig.strategy_name = "ICT OTE (Bullish)";
-            sig.suggested_sl = g_structure.last_low - atr_buf;
+
+            // Tighten SL to the deeper of the bounce candle low or the 88.6% level.
+            double sl_anchor = MathMin(curr.low, fib_88);
+            sig.suggested_sl = sl_anchor - atr_buf;
+            return sig;
         }
     }
 
@@ -1274,13 +1292,21 @@ SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     else if (g_structure.structure == STRUCT_BEAR && g_htf_trend == -1.0) {
         double fib_62 = g_structure.last_low + range * 0.618;
         double fib_79 = g_structure.last_low + range * 0.786;
+        double fib_88 = g_structure.last_low + range * 0.886; // Proximate invalidation
+
         if (fib_62 <= close_price && close_price <= fib_79 && curr.close < curr.open) {
             sig.valid = true;
             sig.direction = ZONE_BEAR;
             sig.strategy_name = "ICT OTE (Bearish)";
-            sig.suggested_sl = g_structure.last_high + atr_buf;
+
+            // Tighten SL to the higher of the bounce candle high or the 88.6% level.
+            double sl_anchor = MathMax(curr.high, fib_88);
+            sig.suggested_sl = sl_anchor + atr_buf;
+            return sig;
         }
     }
+
+    sig.diagnostic = "Price outside Fib zone or trend misaligned";
     return sig;
 }
 
@@ -1297,7 +1323,11 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
     double close_price = curr.close;
     bool bouncing_up = close_price > curr.open;
     bool bouncing_down = close_price < curr.open;
-    if (!bouncing_up && !bouncing_down) return sig;
+
+    if (!bouncing_up && !bouncing_down) {
+        sig.diagnostic = "No bounce detected";
+        return sig;
+    }
 
     double atr_buf = atr * 0.2;
 
@@ -1306,6 +1336,7 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
         for (int i = 0; i < g_ifvg_count; i++) {
             if (!g_ifvgs[i].active || g_ifvgs[i].zone_type != ZONE_BULL) continue;
             if (g_ifvgs[i].mitigations > 2) continue;
+
             // Price must have touched the IFVG and closed ABOVE the CE midpoint
             double ce_mid = (g_ifvgs[i].zone_high + g_ifvgs[i].zone_low) / 2.0;
             if (curr.low <= g_ifvgs[i].zone_high && close_price > ce_mid) {
@@ -1326,6 +1357,7 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
         for (int i = 0; i < g_ifvg_count; i++) {
             if (!g_ifvgs[i].active || g_ifvgs[i].zone_type != ZONE_BEAR) continue;
             if (g_ifvgs[i].mitigations > 2) continue;
+
             double ce_mid = (g_ifvgs[i].zone_high + g_ifvgs[i].zone_low) / 2.0;
             if (curr.high >= g_ifvgs[i].zone_low && close_price < ce_mid) {
                 sig.valid = true;
@@ -1340,13 +1372,14 @@ SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
         }
     }
 
+    sig.diagnostic = "No touching zone / invalid CE close";
     return sig;
 }
 
-/// @brief STRATEGY 4: POI Reversal at Order Block / FVG.
-/// Enters at validated OBs and FVGs that have been tested AFTER a
-/// Tier-2+ sweep occurred within the recency window. Requires vol > 2.0
-/// for MAJOR/BREAKER OBs to ensure the institutional defending entity is
+/// @brief STRATEGY 4: POI Reversal at Order Block.
+/// Enters at validated OBs that have been tested AFTER a
+/// Tier-2+ sweep occurred within the recency window.
+/// Requires vol > 2.0 for MAJOR/BREAKER OBs to ensure the institutional defending entity is present.
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
 /// @return SSignal with valid=true if conditions met, otherwise valid=false.
@@ -1354,20 +1387,26 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
     // Only after a significant sweep occurred recently (not necessarily this bar)
-    if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
+    if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) {
+        sig.diagnostic = "No recent sweep";
+        return sig;
+    }
 
     double close_price = curr.close;
     bool bouncing_up = close_price > curr.open;
     bool bouncing_down = close_price < curr.open;
-    if (!bouncing_up && !bouncing_down) return sig;
 
-    double atr_buf = atr * 0.2;
+    if (!bouncing_up && !bouncing_down) {
+        sig.diagnostic = "No bounce detected"; return sig;
+    }
+
 
     if (bouncing_up && g_recent_sweep_dir == ZONE_BULL) {
         // Bullish: OB bounce
         for (int i = 0; i < g_ob_count; i++) {
             if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BULL) continue;
             if (g_obs[i].mitigations > 2 || g_obs[i].ob_tier == OB_INTERNAL || g_obs[i].vol_strength < 2.0) continue;
+
             double ce_mid = (g_obs[i].zone_high + g_obs[i].zone_low) / 2.0;
             if (curr.low <= g_obs[i].zone_high && close_price > ce_mid) {
                 string tier_name = (g_obs[i].ob_tier == OB_BREAKER) ? "BREAKER" : "MAJOR";
@@ -1375,25 +1414,11 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.direction = ZONE_BULL;
                 sig.strategy_name = tier_name + " OB CE Bounce";
 
+                // Apply a wider 0.5x ATR buffer specifically for highly volatile Breaker Blocks
+                double atr_buf = (g_obs[i].ob_tier == OB_BREAKER) ? (atr * 0.5) : (atr * 0.2);
+
                 // Anchor the SL behind the entire Order Block zone
                 double sl_anchor = MathMin(curr.low, g_obs[i].zone_low);
-                sig.suggested_sl = sl_anchor - atr_buf;
-                return sig;
-            }
-        }
-
-        // FVG bounce
-        for (int i = 0; i < g_fvg_count; i++) {
-            if (!g_fvgs[i].active || g_fvgs[i].zone_type != ZONE_BULL) continue;
-            if (g_fvgs[i].mitigations > 2) continue;
-            double ce_mid = (g_fvgs[i].zone_high + g_fvgs[i].zone_low) / 2.0;
-            if (curr.low <= g_fvgs[i].zone_high && close_price > ce_mid) {
-                sig.valid = true;
-                sig.direction = ZONE_BULL;
-                sig.strategy_name = "FVG Bounce";
-
-                // Anchor the SL behind the entire Fair Value Gap zone
-                double sl_anchor = MathMin(curr.low, g_fvgs[i].zone_low);
                 sig.suggested_sl = sl_anchor - atr_buf;
                 return sig;
             }
@@ -1405,6 +1430,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
         for (int i = 0; i < g_ob_count; i++) {
             if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BEAR) continue;
             if (g_obs[i].mitigations > 2 || g_obs[i].ob_tier == OB_INTERNAL || g_obs[i].vol_strength < 2.0) continue;
+
             double ce_mid = (g_obs[i].zone_high + g_obs[i].zone_low) / 2.0;
             if (curr.high >= g_obs[i].zone_low && close_price < ce_mid) {
                 string tier_name = (g_obs[i].ob_tier == OB_BREAKER) ? "BREAKER" : "MAJOR";
@@ -1412,82 +1438,24 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
                 sig.direction = ZONE_BEAR;
                 sig.strategy_name = tier_name + " OB CE Bounce";
 
+                // Apply a wider 0.5x ATR buffer specifically for highly volatile Breaker Blocks
+                double atr_buf = (g_obs[i].ob_tier == OB_BREAKER) ? (atr * 0.5) : (atr * 0.2);
+
                 // Anchor the SL above the entire Order Block zone
                 double sl_anchor = MathMax(curr.high, g_obs[i].zone_high);
                 sig.suggested_sl = sl_anchor + atr_buf;
                 return sig;
             }
         }
-
-        // FVG rejection
-        for (int i = 0; i < g_fvg_count; i++) {
-            if (!g_fvgs[i].active || g_fvgs[i].zone_type != ZONE_BEAR) continue;
-            if (g_fvgs[i].mitigations > 2) continue;
-            double ce_mid = (g_fvgs[i].zone_high + g_fvgs[i].zone_low) / 2.0;
-            if (curr.high >= g_fvgs[i].zone_low && close_price < ce_mid) {
-                sig.valid = true;
-                sig.direction = ZONE_BEAR;
-                sig.strategy_name = "FVG Bounce";
-
-                // Anchor the SL above the entire Fair Value Gap zone
-                double sl_anchor = MathMax(curr.high, g_fvgs[i].zone_high);
-                sig.suggested_sl = sl_anchor + atr_buf;
-                return sig;
-            }
-        }
     }
 
-    return sig;
-}
-
-/// @brief STRATEGY 5: VWAP Bounce.
-/// Institutional volume-backed bounce off the session VWAP. Requires:
-/// - Price touch and close on correct side of VWAP
-/// - Volume above average (institutional displacement)
-/// - A Tier 2+ sweep already completed (avoid counter-trend traps)
-/// @param curr Last confirmed bar.
-/// @param atr Current ATR.
-/// @return SSignal with valid=true if conditions met, otherwise valid=false.
-SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
-    SSignal sig; ZeroMemory(sig); sig.valid = false;
-
-    if (g_vwap <= 0 || g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) return sig;
-
-    // Require institutional volume: vol > vol_sma × 1.2
-    MqlRates tmp[];
-    ArraySetAsSeries(tmp, true);
-
-    double vol_sma = 1.0;
-    if (CopyRates(_Symbol, PERIOD_M5, 1, 25, tmp) == 25)
-        vol_sma = GetVolumeSMA(tmp, 1, 20);
-
-    double vol_str = (double)curr.tick_volume / vol_sma;
-    if (vol_str < InpMinVolRatio) return sig;
-
-    double atr_buf = atr * 0.3;
-
-    // Bullish VWAP bounce: recent low touched VWAP, closed above it with green body
-    if (curr.low <= g_vwap && curr.close > g_vwap && curr.close > curr.open && g_recent_sweep_dir == ZONE_BULL) {
-        sig.valid = true;
-        sig.direction = ZONE_BULL;
-        sig.strategy_name = "VWAP Bounce";
-        sig.suggested_sl = curr.low - atr_buf;
-    }
-
-    // Bearish VWAP rejection: recent high touched VWAP, closed below it with red body
-    else if (curr.high >= g_vwap && curr.close < g_vwap && curr.close < curr.open && g_recent_sweep_dir == ZONE_BEAR) {
-        sig.valid = true;
-        sig.direction = ZONE_BEAR;
-        sig.strategy_name = "VWAP Bounce";
-        sig.suggested_sl = curr.high + atr_buf;
-    }
-
+    sig.diagnostic = "No valid OB CE bounce";
     return sig;
 }
 
 /// @brief Unified strategy router: runs all strategies in priority order
 /// and returns the first valid qualifying signal.
-/// Priority: Liquidity Sweep > ICT OTE > IFVG > POI Reversal > VWAP
+/// Priority: Liquidity Sweep > ICT OTE > IFVG > POI Reversal
 /// Also enforces Premium/Discount zone filtering.
 /// @param curr Last confirmed bar (rates[1]).
 /// @param atr Current ATR.
@@ -1495,7 +1463,10 @@ SSignal Strategy_VWAP_Bounce(const MqlRates &curr, double atr) {
 SSignal RouteStrategy(const MqlRates &curr, double atr) {
     SSignal empty; ZeroMemory(empty); empty.valid = false;
 
-    if (!g_structure.valid) return empty;
+    if (!g_structure.valid) {
+        empty.diagnostic = "Router: Structure invalid";
+        return empty;
+    }
 
     // Premium/Discount gate — avoid buying in premium or selling in discount
     double pd = g_structure.pd_array;
@@ -1511,47 +1482,45 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
     }
 
     SSignal sig;
+    string agg_diag = "";
 
     // 1. Liquidity Sweep (highest priority)
     sig = Strategy_LiquiditySweep(curr, atr);
     if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.valid = false;
-        if (sig.direction == ZONE_BEAR && !allow_short) sig.valid = false;
-        if (sig.valid) return sig;
+        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
+        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
+        else return sig;
     }
+    agg_diag += "LiqSweep: " + sig.diagnostic + " | ";
 
     // 2. ICT Optimal Trade Entry (second priority — requires HTF alignment)
     sig = Strategy_ICT_OTE(curr, atr);
     if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.valid = false;
-        if (sig.direction == ZONE_BEAR && !allow_short) sig.valid = false;
-        if (sig.valid) return sig;
+        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
+        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
+        else return sig;
     }
+    agg_diag += "OTE: " + sig.diagnostic + " | ";
 
     // 3. IFVG Mitigation
     sig = Strategy_IFVG_Mitigation(curr, atr);
     if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.valid = false;
-        if (sig.direction == ZONE_BEAR && !allow_short) sig.valid = false;
-        if (sig.valid) return sig;
+        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
+        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
+        else return sig;
     }
+    agg_diag += "IFVG: " + sig.diagnostic + " | ";
 
     // 4. POI Reversal (only after a sweep)
     sig = Strategy_POI_Reversal(curr, atr);
     if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.valid = false;
-        if (sig.direction == ZONE_BEAR && !allow_short) sig.valid = false;
-        if (sig.valid) return sig;
+        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
+        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
+        else return sig;
     }
+    agg_diag += "POIRev: " + sig.diagnostic;
 
-    // 5. VWAP Bounce (lowest priority)
-    sig = Strategy_VWAP_Bounce(curr, atr);
-    if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.valid = false;
-        if (sig.direction == ZONE_BEAR && !allow_short) sig.valid = false;
-        if (sig.valid) return sig;
-    }
-
+    empty.diagnostic = agg_diag;
     return empty;
 }
 
@@ -1559,15 +1528,20 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
 //  SECTION 13: RISK MANAGEMENT
 //==========================================================================
 
-/// @brief Analyzes EA history to calculate a "Net Loss Counter" for gradual recovery.
-/// A loss adds +1. A win subtracts -1 (floored at 0).
-/// Scratch trades are ignored. This ensures risk restores gradually after a drawdown.
+/// @brief Analyzes EA history over the last 30 days to calculate a "Net Loss Counter" for gradual recovery.
+/// A loss adds +1 (capped at 12). A win halves the counter for faster, exponential recovery.
+/// Scratch trades are ignored.
+/// This ensures risk restores proportionally when market conditions improve.
 /// @return Integer count of net losses, used to scale down risk for recovery.
 int GetNetLossCounter() {
     int counter = 0;
+    const int MAX_COUNTER_CAP = 12; // Hard cap to prevent permanent throttle lock
 
-    // Request full history to ensure we can read past deals
-    if (HistorySelect(0, TimeCurrent())) {
+    // Scope HistorySelect to a rolling 30-day window (2,592,000 seconds)
+    datetime current_time = TimeCurrent();
+    datetime start_time = current_time - (30 * 24 * 60 * 60);
+
+    if (HistorySelect(start_time, current_time)) {
         int total = HistoryDealsTotal();
 
         // Iterate forwards from oldest to newest to build the running state
@@ -1590,15 +1564,17 @@ int GetNetLossCounter() {
                         // Ignore near-zero breakeven scratch trades (e.g. within $0.50 of 0)
                         if (profit < -0.5) {
                             counter++;
+                            if (counter > MAX_COUNTER_CAP) counter = MAX_COUNTER_CAP;
                         } else if (profit > 0.5) {
-                            counter--;
-                            if (counter < 0) counter = 0; // Floor at 0
+                            // Exponential recovery curve: halve the counter on a win
+                            counter /= 2;
                         }
                     }
                 }
             }
         }
     }
+
     return counter;
 }
 
@@ -1677,7 +1653,7 @@ double CalculateLotSize(double entry_price, double sl_price, ENUM_ORDER_TYPE ord
     // --- LEVERAGE & MARGIN PROTECTION ---
     double margin_required = 0.0;
     if (!OrderCalcMargin(order_type, _Symbol, lot_size, entry_price, margin_required)) {
-        Print("[Nexubot] OrderCalcMargin failed. Enforcing minimal risk state.");
+        Log("OrderCalcMargin failed. Enforcing minimal risk state.", true);
         lot_size = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     } else {
         double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
@@ -1687,7 +1663,8 @@ double CalculateLotSize(double entry_price, double sl_price, ENUM_ORDER_TYPE ord
             // Scale lot size down proportionally to respect leverage constraints
             double leverage_ratio = max_margin_allowed / margin_required;
             lot_size = lot_size * leverage_ratio;
-            PrintFormat("[Nexubot] Leverage Cap Triggered: Lot scaled down to %.2f (Margin Required: %.2f | Free: %.2f)", lot_size, margin_required, free_margin);
+            Log(StringFormat("Leverage Cap Triggered: Lot scaled down to %.2f (Margin Required: %.2f | Free: %.2f)",
+                lot_size, margin_required, free_margin), true);
         }
     }
 
@@ -1749,21 +1726,76 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
 
     sl_price = is_long ? (entry - sl_dist) : (entry + sl_dist);
 
-    // ---- Take Profit Calculation ----
-    double base_tp_dist = MathMax(atr * InpTPMultiplier, sl_dist * InpMinRR);
-
-    // Cap TP at the nearest opposing structural blockade
+    // ---- Take Profit Calculation (Intelligent Structural Targeting) ----
     double opposing_poi = GetNearestOpposingPOI(signal.direction, entry);
-    double max_tp, actual_tp_dist;
     double pip_buffer = point * 15.0; // Small buffer from blockade
+    double structural_tp = 0.0;
+    double actual_tp_dist;
+
+    // Dynamic Min RR (Slightly looser for Daily/Asian Sweep due to higher $/trade)
+    double actual_min_rr = (signal.strategy_name == "Daily/Asian Sweep") ? 1.8 : InpMinRR;
+    double min_tp_dist = sl_dist * actual_min_rr;
+
+    double base_tp = 0.0;
+    double safe_multiplier = MathMin(InpTPMultiplier, 3.0);
 
     if (is_long) {
-        max_tp = (opposing_poi > 0) ? (opposing_poi - pip_buffer) : (entry + base_tp_dist);
-        tp3_price = MathMin(entry + base_tp_dist, max_tp);
+        // 1. Calculate Base Target (PDH, Asian High, or 3R Fallback)
+        if (g_pdh - pip_buffer >= entry + min_tp_dist) base_tp = g_pdh - pip_buffer;
+        else if (g_asian_high - pip_buffer >= entry + min_tp_dist) base_tp = g_asian_high - pip_buffer;
+        else base_tp = entry + (sl_dist * safe_multiplier);
+
+        // 2. Apply Opposing POI intelligently
+        if (opposing_poi > entry) {
+            double dist_to_base = MathAbs(base_tp - opposing_poi);
+
+            if (opposing_poi - pip_buffer <= entry + min_tp_dist) {
+                // Between entry and min reward (after buffer): skip cap, push to base_tp
+                structural_tp = base_tp;
+            } else if (opposing_poi - pip_buffer < base_tp) {
+                // Beyond min reward but before base_tp: cap at POI
+                structural_tp = opposing_poi - pip_buffer;
+            } else if (dist_to_base <= 1.5 * atr) {
+                // Beyond base_tp but within 1.5 ATR: stretch target to POI
+                structural_tp = opposing_poi - pip_buffer;
+            } else {
+                // Far beyond base_tp: stick to base_tp
+                structural_tp = base_tp;
+            }
+        } else {
+            structural_tp = base_tp;
+        }
+
+        tp3_price = structural_tp;
         actual_tp_dist = tp3_price - entry;
     } else {
-        max_tp = (opposing_poi > 0) ? (opposing_poi + pip_buffer) : (entry - base_tp_dist);
-        tp3_price = MathMax(entry - base_tp_dist, max_tp);
+        // 1. Calculate Base Target (PDL, Asian Low, or 3R Fallback)
+        if (g_pdl > 0 && g_pdl + pip_buffer <= entry - min_tp_dist) base_tp = g_pdl + pip_buffer;
+        else if (g_asian_low > 0 && g_asian_low + pip_buffer <= entry - min_tp_dist) base_tp = g_asian_low + pip_buffer;
+        else base_tp = entry - (sl_dist * safe_multiplier);
+
+        // 2. Apply Opposing POI intelligently
+        if (opposing_poi > 0 && opposing_poi < entry) {
+            double dist_to_base = MathAbs(base_tp - opposing_poi);
+
+            if (opposing_poi + pip_buffer >= entry - min_tp_dist) {
+                // Between entry and min reward (after buffer): skip cap, push to base_tp
+                structural_tp = base_tp;
+            } else if (opposing_poi + pip_buffer > base_tp) {
+                // Beyond min reward but before base_tp: cap at POI
+                structural_tp = opposing_poi + pip_buffer;
+            } else if (dist_to_base <= 1.5 * atr) {
+                // Beyond base_tp but within 1.5 ATR: stretch target to POI
+                structural_tp = opposing_poi + pip_buffer;
+            } else {
+                // Far beyond base_tp: stick to base_tp
+                structural_tp = base_tp;
+            }
+        } else {
+            structural_tp = base_tp;
+        }
+
+        tp3_price = structural_tp;
         actual_tp_dist = entry - tp3_price;
     }
 
@@ -1784,7 +1816,7 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
         return false;
     }
 
-    // Staggered TP levels: 33% / 66% / 100% of full TP distance
+    // Staggered TP levels dynamically set via user input ratios (Default 50% / 75%)
     if (is_long) {
         tp1_price = entry + actual_tp_dist * InpTP1Ratio;
         tp2_price = entry + actual_tp_dist * InpTP2Ratio;
@@ -1996,8 +2028,26 @@ void ManagePosition() {
                     PrintThrottledManageLog(StringFormat("Failed to partially close position at TP1: %d", g_trade.ResultRetcode()));
                 }
             } else {
-                // Initial volume was too small to partial close, simply skip and mark as hit
-                g_pos_state.tp1_hit = true;
+                // Initial volume was too small to partial close.
+                // Fall through to immediate BE capital protection instead of abandoning management.
+                double be_price = g_pos_state.is_long ?
+                                  (g_pos_state.entry_price + g_pos_state.atr_at_entry * InpBEBufferATR) :
+                                  (g_pos_state.entry_price - g_pos_state.atr_at_entry * InpBEBufferATR);
+                be_price = NormalizeDouble(be_price, digits);
+
+                if (ModifyStopLoss(be_price)) {
+                    g_pos_state.tp1_hit = true;
+                    g_pos_state.be_set = true;
+                    string msg = StringFormat("🛡️ %s TP1 Hit! Vol too small for partial. SL moved to Breakeven: %.5f", _Symbol, be_price);
+                    Log(msg);
+                    if (InpEnableAlerts) Alert(msg);
+                    if (InpEnableNotify) SendNotification(msg);
+                    last_tp1_attempt = 0;
+                    g_last_manage_reason = "";
+                } else {
+                    last_tp1_attempt = current_time;
+                    PrintThrottledManageLog(StringFormat("Failed to move SL to BE at TP1 for micro-lot: %d", g_trade.ResultRetcode()));
+                }
             }
         }
     }
@@ -2009,21 +2059,27 @@ void ManagePosition() {
                                             : (curr_price <= g_pos_state.tp2);
 
         if (hit_tp2) {
-            double be_price;
-            if (g_pos_state.is_long)
-                be_price = g_pos_state.entry_price + g_pos_state.atr_at_entry * InpBEBufferATR;
-            else
-                be_price = g_pos_state.entry_price - g_pos_state.atr_at_entry * InpBEBufferATR;
+            // Aligning with intended architecture: TP2 trails stop loss to secure profit.
+            // We lock the SL safely behind at TP1.
+            double trail_price = g_pos_state.tp1;
 
-            be_price = NormalizeDouble(be_price, digits);
-
-            if (ModifyStopLoss(be_price)) {
+            if (ModifyStopLoss(trail_price)) {
                 g_pos_state.tp2_hit = true;
                 g_pos_state.be_set = true;
-                string msg = StringFormat("🛡️ %s TP2 Hit! SL moved to Breakeven: %.5f", _Symbol, be_price);
+                string msg = StringFormat("🛡️ %s TP2 Hit! SL trailed to TP1 to lock in profit: %.5f", _Symbol, trail_price);
                 Log(msg);
                 if (InpEnableAlerts) Alert(msg);
                 if (InpEnableNotify) SendNotification(msg);
+            } else {
+                // Prevent infinite loop if ModifyStopLoss aborts due to the SL already being strictly better
+                double curr_sl = g_position_info.StopLoss();
+                bool already_better = g_pos_state.is_long ? (curr_sl >= trail_price) : (curr_sl <= trail_price);
+
+                if (already_better) {
+                    g_pos_state.tp2_hit = true;
+                } else {
+                    PrintThrottledManageLog(StringFormat("Failed to trail SL at TP2: %d", g_trade.ResultRetcode()));
+                }
             }
         }
     }
@@ -2062,7 +2118,8 @@ void RunMarketAnalysis() {
     if (max_spread_allowed > 0 && current_spread > max_spread_allowed) {
         // Throttle: Only log the spread warning once every 5 minutes (300 seconds)
         if (TimeCurrent() - last_spread_log >= 300) {
-            PrintFormat("[Nexubot] Spread too high (%d points > Max %d). Scanning paused.", current_spread, max_spread_allowed);
+            Log(StringFormat("Spread too high (%d points > Max %d). Scanning paused.",
+                current_spread, max_spread_allowed), true);
             last_spread_log = TimeCurrent();
         }
         return; // Exit cycle safely
@@ -2095,7 +2152,6 @@ void RunMarketAnalysis() {
     // ---- Update global context indicators ----
     g_htf_trend = GetHTFTrend();
     g_current_atr = GetATR();
-    g_vwap = CalculateVWAP(rates, copied);
     GetDailyLevels(g_pdh, g_pdl);
     GetAsianRange(g_asian_high, g_asian_low);
 
@@ -2151,9 +2207,21 @@ void RunMarketAnalysis() {
 
     // Update the global sweep trackers
     if (sweep_tier >= SWEEP_MAJOR) {
-        g_recent_sweep_tier = sweep_tier;
-        g_recent_sweep_dir = sweep_dir;
-        g_bars_since_sweep = 0;
+        // Prevent a lesser Major Sweep from overwriting an active Daily/Asian Sweep
+        // in the same direction, preserving the highest-value structural context.
+        bool active_daily = (g_recent_sweep_tier == SWEEP_DAILY &&
+                             g_bars_since_sweep <= InpSweepRecencyBars &&
+                             g_recent_sweep_dir == sweep_dir);
+
+        if (!active_daily || sweep_tier == SWEEP_DAILY) {
+            g_recent_sweep_tier = sweep_tier;
+            g_recent_sweep_dir = sweep_dir;
+            g_bars_since_sweep = 0;
+        } else {
+            // We have a fresh major sweep, but we are already tracking a fresh daily sweep.
+            // Keep the active Daily sweep to maintain priority, but increment its age.
+            g_bars_since_sweep++;
+        }
     } else {
         g_bars_since_sweep++;
     }
@@ -2181,8 +2249,21 @@ void RunMarketAnalysis() {
     // ---- Route through strategy engine ----
     SSignal signal = RouteStrategy(rates[1], g_current_atr);
     if (!signal.valid) {
-        PrintThrottledSkipReason("No strategy qualified.");
+        PrintThrottledSkipReason("No strategy qualified. Diagnostics -> " + signal.diagnostic);
         return;
+    }
+
+    // ---- Guard: Directional Asymmetry Filter (Short Trades) ----
+    // Compensate for inherent macro long-bias in volatile assets.
+    // Shorts face a natural headwind and must therefore demonstrate
+    // significantly fresher structural momentum to be validated.
+    if (signal.direction == ZONE_BEAR && InpRequireBOS) {
+        int max_short_bars = (int)MathFloor(InpBOSRecencyBars * 0.5); // Halve the allowed window
+        if (g_bars_since_break > max_short_bars) {
+            PrintThrottledSkipReason(StringFormat("Short rejected: Momentum too stale (%d bars > max %d for shorts).",
+                                     g_bars_since_break, max_short_bars));
+            return;
+        }
     }
 
     // ---- Guard: POI Confluence Filter ----
@@ -2391,7 +2472,6 @@ int OnInit() {
         g_structure = DetectStructure(tmp, copied);
         g_current_atr = GetATR();
         g_htf_trend = GetHTFTrend();
-        g_vwap = CalculateVWAP(tmp, copied);
         GetDailyLevels(g_pdh, g_pdl);
         GetAsianRange(g_asian_high, g_asian_low);
     }
@@ -2477,25 +2557,3 @@ void OnTick() {
     // ---- 3. Run full market analysis on new bar close ----
     RunMarketAnalysis();
 }
-
-//+------------------------------------------------------------------+
-//|  END OF NEXUBOT.MQ5                                              |
-//|                                                                  |
-//|  DEPLOYMENT INSTRUCTIONS:                                        |
-//|  1. Copy this file to: [MT5 Data Folder]\MQL5\Experts\           |
-//|  2. In MetaEditor, compile with F7 (requires zero errors).       |
-//|  3. In MT5, drag Nexubot onto an M5 chart of your target symbol. |
-//|  4. Enable "Allow Automated Trading" in the EA properties.       |
-//|  5. Ensure the symbol is visible in Market Watch.                |
-//|  6. The EA will warm up the POI state on first attach and begin  |
-//|     scanning immediately on the next M5 bar close.               |
-//|                                                                  |
-//|  TUNING GUIDE (Input Parameters):                                |
-//|  - InpMinSweepTier: Set to 3 (Daily only) for maximum quality.  |
-//|    Set to 2 (Major+Daily) for a good balance.                    |
-//|  - InpRequireHTFAlign: Set false only for range-bound markets.   |
-//|  - InpSessionFilter: Keep true for London/NY-only trading.       |
-//|  - InpRiskPercent: Start at 1.0% for live, increase after        |
-//|    profitable track record is established.                        |
-//|  - InpMaxSpreadPoints: Set to 20-30 for Forex, 50 for XAU/BTC.  |
-//+------------------------------------------------------------------+
