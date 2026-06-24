@@ -47,7 +47,7 @@ input bool            InpRequireHTFAlign   = true;   // Require H1 trend aligned
 input bool            InpRequireBOS        = true;   // Require BOS or CHoCH confirmation
 input bool            InpSessionFilter     = true;   // Only trade during active killzones
 input int             InpMaxSpreadPoints   = 500;     // Max allowed spread in points (0=off)
-input double          InpMinVolRatio       = 0.75;     // Min volume ratio for displacement
+input double          InpMinVolRatio       = 1.0;     // Min volume ratio for displacement
 input bool            InpRequirePOIConfluence = true; // Require setup to trigger near an active POI
 input double          InpPOIProximityATR   = 2.0;     // Max distance to POI (x ATR) for confluence
 
@@ -93,9 +93,9 @@ input int             InpNYEnd             = 23;     // New York session end hou
 
 //--- Multi-TP Exit Management
 input group           "==== MULTI-TP EXIT MANAGEMENT ===="
-input double          InpTP1Ratio          = 0.50;   // TP1 = % of full TP3 distance (Trigger for partial close)
+input double          InpTP1Ratio          = 0.33;   // TP1 = % of full TP3 distance (Trigger for partial close)
 input double          InpTP1PartialVol     = 0.50;   // Percentage of original lot size to close at TP1
-input double          InpTP2Ratio          = 0.75;   // TP2 = % of full TP3 distance (Trigger for Breakeven move)
+input double          InpTP2Ratio          = 0.66;   // TP2 = % of full TP3 distance (Trigger for Trail to TP1)
 input double          InpBEBufferATR       = 0.15;   // Breakeven buffer above entry (x ATR)
 input int             InpMaxTradeMins      = 240;    // Max trade duration (minutes)
 
@@ -204,6 +204,11 @@ struct SStrategyStats {
     double net_profit;
 };
 
+struct SDiagnosticStats {
+    string reason;
+    int    count;
+};
+
 /// @brief Session activity context for current time.
 struct SSessionInfo {
     bool   is_active;       // Is at least one session currently active?
@@ -251,11 +256,13 @@ SPositionState g_pos_state;
 SStrategyStats g_strategy_stats[20];
 int g_stats_count = 0;
 
+SDiagnosticStats g_diag_stats[100]; // Array for tracking specific diagnostic reasons
+int g_diag_count = 0;
+
 // --- Bar timing — used to detect when a new M5 bar has formed ---
 datetime g_last_bar_time = 0;
 
 // --- State tracking for log throttling ---
-string g_last_skip_reason = "";
 string g_last_manage_reason = "";
 static datetime last_spread_log = 0;
 
@@ -263,13 +270,13 @@ static datetime last_spread_log = 0;
 int g_bars_since_last_signal = 9999;
 int g_bars_since_sweep = 9999; // Bars elapsed since the last Tier2+ sweep
 int g_recent_sweep_tier = SWEEP_NONE; // Tier of that most recent sweep
+double g_recent_sweep_depth = 0.0;
 int g_recent_sweep_dir = -1; // Direction of the most recent sweep (ZONE_BULL/ZONE_BEAR)
 int g_bars_since_break = 9999; // Bars elapsed since the last BOS/CHoCH
 int g_recent_break_dir = STRUCT_FLAT; // Direction of that most recent break
 
 // --- Volatile asset identifier suffixes ---
 string g_volatile_ids[] = {"XAU", "XAG", "BTC", "ETH", "US30", "NAS", "SPX", "UK100", "GER40"};
-
 
 //==========================================================================
 //  SECTION 5: UTILITY & TECHNICAL ANALYSIS HELPERS
@@ -394,16 +401,45 @@ void Log(const string msg, bool verbose_only = false) {
     PrintFormat("[Nexubot] %s", msg);
 }
 
-/// @brief Helper function to prevent log spam for consecutive identical skip reasons
-/// @param reason The reason for skipping a trade signal.
+/// @brief Helper function to prevent log spam. Tracks individual reasons and throttles them to once per hour.
+/// @param reason The specific reason/message to log. Each unique reason is tracked separately for throttling.
 void PrintThrottledSkipReason(string reason) {
-    if (reason != g_last_skip_reason) {
-        Log(reason, true); // Uses your existing Log() function
-        g_last_skip_reason = reason;
+    static string tracked_reasons[20];
+    static datetime tracked_times[20];
+    static int track_count = 0;
+
+    datetime current_time = TimeCurrent();
+    int idx = -1;
+
+    // Search for existing reason in our tracker
+    for (int i = 0; i < track_count; i++) {
+        if (tracked_reasons[i] == reason) {
+            idx = i;
+            break;
+        }
+    }
+
+    // If it's a new reason, add it to the tracker
+    if (idx == -1) {
+        if (track_count < 20) {
+            idx = track_count;
+            tracked_reasons[idx] = reason;
+            tracked_times[idx] = 0;
+            track_count++;
+        } else {
+            idx = 0; // Safe fallback if array fills up
+        }
+    }
+
+    // Only print if 1 hour (3600 seconds) has passed since THIS specific reason was logged
+    if (current_time - tracked_times[idx] >= 3600) {
+        Log(reason, true);
+        tracked_times[idx] = current_time;
     }
 }
 
 /// @brief Helper function to prevent log spam for consecutive identical trade management events
+/// @param msg The specific management reason/message to log. Only logs if it's different from the last one.
 void PrintThrottledManageLog(string msg) {
     if (msg != g_last_manage_reason) {
         Log(msg, true);
@@ -695,31 +731,43 @@ void DetectLiquiditySweep(const MqlRates &rates[], int total,
     // TIER 3: Daily PDH/PDL and Asian Session Range Sweeps
     // -----------------------------------------------------------------------
     if (g_pdl > 0 && rec_lo5 < g_pdl && close > g_pdl) {
-        tier = SWEEP_DAILY;
-        depth_atr = (g_pdl - rec_lo5) / atr;
-        sweep_dir = ZONE_BULL;
-        return;
+        double depth = (g_pdl - rec_lo5) / atr;
+        if (depth >= 0.12) {
+            tier = SWEEP_DAILY;
+            depth_atr = depth;
+            sweep_dir = ZONE_BULL;
+            return;
+        }
     }
     if (g_pdh > 0 && rec_hi5 > g_pdh && close < g_pdh) {
-        tier = SWEEP_DAILY;
-        depth_atr = (rec_hi5 - g_pdh) / atr;
-        sweep_dir = ZONE_BEAR;
-        return;
+        double depth = (rec_hi5 - g_pdh) / atr;
+        if (depth >= 0.12) {
+            tier = SWEEP_DAILY;
+            depth_atr = depth;
+            sweep_dir = ZONE_BEAR;
+            return;
+        }
     }
 
     // Relax the London Open restriction to allow Asian range sweeps
     // throughout the entire London session, significantly increasing trade frequency.
     if (session.is_london_session && g_asian_low > 0 && rec_lo5 < g_asian_low && close > g_asian_low) {
-        tier = SWEEP_DAILY;
-        depth_atr = (g_asian_low - rec_lo5) / atr;
-        sweep_dir = ZONE_BULL;
-        return;
+        double depth = (g_asian_low - rec_lo5) / atr;
+        if (depth >= 0.12) {
+            tier = SWEEP_DAILY;
+            depth_atr = depth;
+            sweep_dir = ZONE_BULL;
+            return;
+        }
     }
     if (session.is_london_session && g_asian_high > 0 && rec_hi5 > g_asian_high && close < g_asian_high) {
-        tier = SWEEP_DAILY;
-        depth_atr = (rec_hi5 - g_asian_high) / atr;
-        sweep_dir = ZONE_BEAR;
-        return;
+        double depth = (rec_hi5 - g_asian_high) / atr;
+        if (depth >= 0.12) {
+            tier = SWEEP_DAILY;
+            depth_atr = depth;
+            sweep_dir = ZONE_BEAR;
+            return;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -796,6 +844,9 @@ void CompactZoneArray(SZone &zones[], int &count) {
 
 /// @brief Adds a new zone to an array if capacity allows.
 /// If the array is full, the oldest zone is evicted (FIFO).
+/// @param zones The zone array to add to.
+/// @param count [In/Out] The current active count of zones in the array.
+/// @param new_zone The new zone to add.
 void AddZone(SZone &zones[], int &count, const SZone &new_zone) {
     // Cap the logical size to the user input, safely bounded by the macro
     int max_allowed = (int)MathMin(InpMaxPOIsPerType, MAX_ZONES);
@@ -1112,6 +1163,7 @@ double GetNearestOpposingPOI(int direction, double entry) {
             }
         }
     }
+
     return nearest;
 }
 
@@ -1149,16 +1201,13 @@ SSessionInfo GetSessionInfo() {
     if (is_ny) {
         info.session_name = "NY";
         info.multiplier = 1.05;
-    }
-    else if (is_london) {
+    } else if (is_london) {
         info.session_name = "LONDON";
         info.multiplier = 1.03;
-    }
-    else if (is_asian) {
+    } else if (is_asian) {
         info.session_name = "ASIAN";
         info.multiplier = 0.97;
-    }
-    else {
+    } else {
         info.session_name = "DEAD";
         info.multiplier = 0.90;
     }
@@ -1173,26 +1222,55 @@ SSessionInfo GetSessionInfo() {
 //==========================================================================
 
 /// @brief STRATEGY 1: Liquidity Sweep with BOS confirmation.
-/// Highest quality setup. Requires a Tier-2+ sweep AND a structural break
-/// to have BOTH occurred within their respective recency windows.
+/// Highest quality setup. Requires a Tier-2+ sweep AND a structural break.
 /// @param curr Last confirmed bar (rates[1]).
 /// @param atr Current ATR.
 /// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
-    // Require a Tier2+ sweep within the recency window
-    if (g_recent_sweep_tier < 2 || g_bars_since_sweep > InpSweepRecencyBars) {
+    // 1. Minimum Tier Requirement
+    if (g_recent_sweep_tier < SWEEP_MAJOR) {
         sig.diagnostic = "No recent Tier2+ sweep";
         return sig;
     }
 
-    // Require a BOS/CHoCH within the recency window — no direction filter yet,
-    // direction alignment is enforced below.
+    // Differentiated Recency & Depth Gates
+    if (g_recent_sweep_tier == SWEEP_MAJOR) {
+        // Major sweeps lose relevance much faster. Cap at 24 bars.
+        if (g_bars_since_sweep > 24) {
+            sig.diagnostic = "Major sweep too stale (>24 bars)";
+            return sig;
+        }
+
+        // Filter out minor spread-noise sweeps
+        if (g_recent_sweep_depth < 0.15) {
+            sig.diagnostic = "Major sweep depth < 0.15 ATR";
+            return sig;
+        }
+    } else if (g_recent_sweep_tier == SWEEP_DAILY) {
+        // Daily/Asian sweeps retain relevance longer. Use global input cap.
+        if (g_bars_since_sweep > InpSweepRecencyBars) {
+            sig.diagnostic = "Daily sweep too stale";
+            return sig;
+        }
+    }
+
+    // 3. BOS / CHoCH Alignment
     int bos_dir = g_recent_break_dir;
     if (bos_dir == STRUCT_FLAT || g_bars_since_break > InpBOSRecencyBars) {
         sig.diagnostic = "No recent BOS";
         return sig;
+    }
+
+    // --- Liquidity Sweep Shorts ---
+    // Toggle this block ON/OFF during your isolated short backtests
+    if (bos_dir == STRUCT_BEAR) {
+        int max_short_bars = (int)MathFloor(InpBOSRecencyBars * 0.5);
+        if (g_bars_since_break > max_short_bars) {
+            sig.diagnostic = "Short BOS too stale";
+            return sig;
+        }
     }
 
     // The sweep must align with the BOS direction
@@ -1202,17 +1280,10 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
         return sig;
     }
 
-    double atr_buf = atr * InpSweepSLBufferATR;
-
-    // Identify high-noise session open bars (first 30 minutes of a killzone)
-    MqlDateTime dt;
-    TimeToStruct(curr.time, dt);
-    bool is_session_open = (dt.min < 30) && (dt.hour == InpAsianStart || dt.hour == InpLondonStart || dt.hour == InpNYStart);
-
-    // Dynamically widen the SL buffer to 0.60x ATR to survive session-open spread widening
-    if (g_recent_sweep_tier == SWEEP_MAJOR && is_session_open) {
-        atr_buf = atr * 0.60;
-    }
+    // Differentiated SL Buffer
+    // SWEEP_DAILY gets the standard user-defined 0.40x ATR buffer.
+    // SWEEP_MAJOR is wider (0.65x ATR) to survive standard re-accumulations and noise.
+    double atr_buf = (g_recent_sweep_tier == SWEEP_DAILY) ? (atr * InpSweepSLBufferATR) : (atr * 0.65);
 
     string name = (g_recent_sweep_tier == SWEEP_DAILY) ? "Daily/Asian Sweep" : "Major Swing Sweep";
 
@@ -1232,143 +1303,115 @@ SSignal Strategy_LiquiditySweep(const MqlRates &curr, double atr) {
 }
 
 /// @brief STRATEGY 2: ICT Optimal Trade Entry (OTE Fibonacci).
-/// Enters at the 62-79% Fibonacci retracement of the last swing following
+/// Enters at the 60-80% Fibonacci retracement of the last swing following
 /// a confirmed BOS. Requires H1 trend alignment for additional confirmation.
-/// Historically the cleanest "smart money" entry model.
+/// Restricted to LONG (Bullish) setups only due to XAUUSDm macro regime.
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
 /// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_ICT_OTE(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
+    // 1. Structure validation
     if (!g_structure.valid || g_structure.last_high <= 0 || g_structure.last_low <= 0) {
         sig.diagnostic = "Structure invalid/no range";
+        return sig;
+    }
+
+    // 2. Strict Bullish-Only Gate
+    if (g_structure.structure != STRUCT_BULL || g_htf_trend != 1.0) {
+        sig.diagnostic = "OTE restricted to Bullish/Long setups only";
         return sig;
     }
 
     double close_price = curr.close;
     double atr_buf = atr * 0.2;
     double range = g_structure.last_high - g_structure.last_low;
+
     if (range <= 0) {
         sig.diagnostic = "Invalid structure range";
         return sig;
     }
 
-    // Volume confirmation for OTE entries
+    // 3. Volume confirmation for OTE entries
     MqlRates rates_check[];
     ArraySetAsSeries(rates_check, true);
-
     double vol_sma = 1.0;
-    if (CopyRates(_Symbol, PERIOD_M5, 1, 25, rates_check) == 25)
+
+    if (CopyRates(_Symbol, PERIOD_M5, 1, 25, rates_check) == 25) {
         vol_sma = GetVolumeSMA(rates_check, 1, 20);
+    }
 
     double vol_ratio = (double)curr.tick_volume / vol_sma;
 
-    // Relaxed to 0.75 volume constraint. OTE pullbacks typically occur on lower volume.
+    // Ensures the retracement bounce is a genuine high-volume rejection, not low-volume drift.
     if (vol_ratio < InpMinVolRatio) {
         sig.diagnostic = "Volume too low for OTE bounce";
         return sig;
     }
 
-    // Bullish OTE: Structure is BULL + H1 trending up → buy the dip to 62-79%
-    if (g_structure.structure == STRUCT_BULL && g_htf_trend == 1.0) {
-        double fib_62 = g_structure.last_high - range * 0.618;
-        double fib_79 = g_structure.last_high - range * 0.786;
-        double fib_88 = g_structure.last_high - range * 0.886; // Proximate invalidation
+    double fib_60 = g_structure.last_high - range * 0.60;
+    double fib_80 = g_structure.last_high - range * 0.80;
+    double fib_88 = g_structure.last_high - range * 0.886; // Proximate invalidation
 
-        if (fib_79 <= close_price && close_price <= fib_62 && curr.close > curr.open) {
-            sig.valid = true;
-            sig.direction = ZONE_BULL;
-            sig.strategy_name = "ICT OTE (Bullish)";
+    if (fib_80 <= close_price && close_price <= fib_60 && curr.close > curr.open) {
+        sig.valid = true;
+        sig.direction = ZONE_BULL;
+        sig.strategy_name = "ICT OTE (Bullish)";
 
-            // Tighten SL to the deeper of the bounce candle low or the 88.6% level.
-            double sl_anchor = MathMin(curr.low, fib_88);
-            sig.suggested_sl = sl_anchor - atr_buf;
-            return sig;
-        }
+        // Tighten SL to the deeper of the bounce candle low or the 88.6% level.
+        double sl_anchor = MathMin(curr.low, fib_88);
+        sig.suggested_sl = sl_anchor - atr_buf;
+        return sig;
     }
 
-    // Bearish OTE: Structure is BEAR + H1 trending down → sell the rally to 62-79%
-    else if (g_structure.structure == STRUCT_BEAR && g_htf_trend == -1.0) {
-        double fib_62 = g_structure.last_low + range * 0.618;
-        double fib_79 = g_structure.last_low + range * 0.786;
-        double fib_88 = g_structure.last_low + range * 0.886; // Proximate invalidation
-
-        if (fib_62 <= close_price && close_price <= fib_79 && curr.close < curr.open) {
-            sig.valid = true;
-            sig.direction = ZONE_BEAR;
-            sig.strategy_name = "ICT OTE (Bearish)";
-
-            // Tighten SL to the higher of the bounce candle high or the 88.6% level.
-            double sl_anchor = MathMax(curr.high, fib_88);
-            sig.suggested_sl = sl_anchor + atr_buf;
-            return sig;
-        }
-    }
-
-    sig.diagnostic = "Price outside Fib zone or trend misaligned";
+    sig.diagnostic = "Price outside Fib zone";
     return sig;
 }
 
-/// @brief STRATEGY 3: IFVG Mitigation Re-Test.
-/// Enters after an Inverted Fair Value Gap (a previously-bullish gap that
-/// has been invalidated) acts as new resistance/support. Requires the
-/// close to be on the "correct" side of the IFVG CE (midpoint).
+/// @brief STRATEGY 3: IFVG Mitigation Re-Test (Restricted to SHORT only).
+/// Enters after a Bear Inverted Fair Value Gap (a previously-bullish gap that
+/// has been invalidated) acts as new resistance.
+/// Long entries removed due to negative EV in secular bull markets.
 /// @param curr Last confirmed bar.
 /// @param atr Current ATR.
 /// @return SSignal with valid=true if conditions met, otherwise valid=false.
 SSignal Strategy_IFVG_Mitigation(const MqlRates &curr, double atr) {
     SSignal sig; ZeroMemory(sig); sig.valid = false;
 
+    // 1. Institutional Sweep Context Guard
+    // Ensures IFVG entries only fire after a major liquidity grab.
+    if (g_recent_sweep_tier < SWEEP_MAJOR || g_bars_since_sweep > InpSweepRecencyBars) {
+        sig.diagnostic = "No recent Major/Daily sweep";
+        return sig;
+    }
+
     double close_price = curr.close;
-    bool bouncing_up = close_price > curr.open;
     bool bouncing_down = close_price < curr.open;
 
-    if (!bouncing_up && !bouncing_down) {
-        sig.diagnostic = "No bounce detected";
+    // Restrict to Short (BEAR IFVG) setups only
+    if (!bouncing_down) {
+        sig.diagnostic = "No bearish bounce detected";
         return sig;
     }
 
     double atr_buf = atr * 0.2;
 
-    if (bouncing_up) {
-        // Check if price is bouncing off a BULL IFVG (former resistance acting as support)
-        for (int i = 0; i < g_ifvg_count; i++) {
-            if (!g_ifvgs[i].active || g_ifvgs[i].zone_type != ZONE_BULL) continue;
-            if (g_ifvgs[i].mitigations > 2) continue;
+    // 3. Price bouncing off a BEAR IFVG (former support acting as resistance)
+    for (int i = 0; i < g_ifvg_count; i++) {
+        if (!g_ifvgs[i].active || g_ifvgs[i].zone_type != ZONE_BEAR) continue;
+        if (g_ifvgs[i].mitigations > 2) continue;
 
-            // Price must have touched the IFVG and closed ABOVE the CE midpoint
-            double ce_mid = (g_ifvgs[i].zone_high + g_ifvgs[i].zone_low) / 2.0;
-            if (curr.low <= g_ifvgs[i].zone_high && close_price > ce_mid) {
-                sig.valid = true;
-                sig.direction = ZONE_BULL;
-                sig.strategy_name = "IFVG Re-Test";
+        double ce_mid = (g_ifvgs[i].zone_high + g_ifvgs[i].zone_low) / 2.0;
+        if (curr.high >= g_ifvgs[i].zone_low && close_price < ce_mid) {
+            sig.valid = true;
+            sig.direction = ZONE_BEAR;
+            sig.strategy_name = "IFVG Re-Test";
 
-                // Anchor the SL behind the entire IFVG zone, not just the single candle wick
-                double sl_anchor = MathMin(curr.low, g_ifvgs[i].zone_low);
-                sig.suggested_sl = sl_anchor - atr_buf;
-                return sig;
-            }
-        }
-    }
-
-    if (bouncing_down) {
-        // Price bouncing off a BEAR IFVG (former support acting as resistance)
-        for (int i = 0; i < g_ifvg_count; i++) {
-            if (!g_ifvgs[i].active || g_ifvgs[i].zone_type != ZONE_BEAR) continue;
-            if (g_ifvgs[i].mitigations > 2) continue;
-
-            double ce_mid = (g_ifvgs[i].zone_high + g_ifvgs[i].zone_low) / 2.0;
-            if (curr.high >= g_ifvgs[i].zone_low && close_price < ce_mid) {
-                sig.valid = true;
-                sig.direction = ZONE_BEAR;
-                sig.strategy_name = "IFVG Re-Test";
-
-                // Anchor the SL above the entire IFVG zone
-                double sl_anchor = MathMax(curr.high, g_ifvgs[i].zone_high);
-                sig.suggested_sl = sl_anchor + atr_buf;
-                return sig;
-            }
+            // Anchor the SL above the entire IFVG zone
+            double sl_anchor = MathMax(curr.high, g_ifvgs[i].zone_high);
+            sig.suggested_sl = sl_anchor + atr_buf;
+            return sig;
         }
     }
 
@@ -1426,6 +1469,13 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
     }
 
     if (bouncing_down && g_recent_sweep_dir == ZONE_BEAR) {
+        // Toggle this block ON/OFF during your isolated short backtests
+        int max_short_bars = (int)MathFloor(InpBOSRecencyBars * 0.5);
+        if (g_bars_since_break > max_short_bars) {
+            sig.diagnostic = "Short BOS too stale (M2 Test)";
+            return sig;
+        }
+
         // Bearish: OB rejection
         for (int i = 0; i < g_ob_count; i++) {
             if (!g_obs[i].active || g_obs[i].zone_type != ZONE_BEAR) continue;
@@ -1455,7 +1505,7 @@ SSignal Strategy_POI_Reversal(const MqlRates &curr, double atr) {
 
 /// @brief Unified strategy router: runs all strategies in priority order
 /// and returns the first valid qualifying signal.
-/// Priority: Liquidity Sweep > ICT OTE > IFVG > POI Reversal
+/// Priority: 1. ICT OTE, 2. Liquidity Sweep, 3. IFVG Mitigation, 4. POI Reversal.
 /// Also enforces Premium/Discount zone filtering.
 /// @param curr Last confirmed bar (rates[1]).
 /// @param atr Current ATR.
@@ -1484,16 +1534,8 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
     SSignal sig;
     string agg_diag = "";
 
-    // 1. Liquidity Sweep (highest priority)
-    sig = Strategy_LiquiditySweep(curr, atr);
-    if (sig.valid) {
-        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
-        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
-        else return sig;
-    }
-    agg_diag += "LiqSweep: " + sig.diagnostic + " | ";
-
-    // 2. ICT Optimal Trade Entry (second priority — requires HTF alignment)
+    // 1. ICT Optimal Trade Entry
+    // Most consistently profitable strategy gets first claim on capital.
     sig = Strategy_ICT_OTE(curr, atr);
     if (sig.valid) {
         if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
@@ -1501,6 +1543,15 @@ SSignal RouteStrategy(const MqlRates &curr, double atr) {
         else return sig;
     }
     agg_diag += "OTE: " + sig.diagnostic + " | ";
+
+    // 2. Liquidity Sweep (Moved to Priority 2)
+    sig = Strategy_LiquiditySweep(curr, atr);
+    if (sig.valid) {
+        if (sig.direction == ZONE_BULL && !allow_long) sig.diagnostic = "PD/HTF blocked long";
+        else if (sig.direction == ZONE_BEAR && !allow_short) sig.diagnostic = "PD/HTF blocked short";
+        else return sig;
+    }
+    agg_diag += "LiqSweep: " + sig.diagnostic + " | ";
 
     // 3. IFVG Mitigation
     sig = Strategy_IFVG_Mitigation(curr, atr);
@@ -1737,7 +1788,7 @@ bool CalculateSLTP(const SSignal &signal, double entry, double atr,
     double min_tp_dist = sl_dist * actual_min_rr;
 
     double base_tp = 0.0;
-    double safe_multiplier = MathMin(InpTPMultiplier, 3.0);
+    double safe_multiplier = MathMin(InpTPMultiplier, 5.0);
 
     if (is_long) {
         // 1. Calculate Base Target (PDH, Asian High, or 3R Fallback)
@@ -1863,7 +1914,7 @@ bool ExecuteTrade(const SSignal &signal, double sl, double tp1, double tp2,
 
     if (!success) {
         Log(StringFormat("Order failed: %d - %s", g_trade.ResultRetcode(),
-                  g_trade.ResultRetcodeDescription()));
+                          g_trade.ResultRetcodeDescription()));
         return false;
     }
 
@@ -2004,7 +2055,7 @@ void ManagePosition() {
             ENUM_SYMBOL_TRADE_MODE trade_mode = (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
             if (trade_mode == SYMBOL_TRADE_MODE_DISABLED || trade_mode == SYMBOL_TRADE_MODE_CLOSEONLY) {
                 last_tp1_attempt = current_time; // Trigger throttle
-                PrintThrottledManageLog(StringFormat("TP1 Partial Close aborted: %s is currently closed.", _Symbol));
+                PrintThrottledManageLog(StringFormat("TP1 Management aborted: %s is currently closed.", _Symbol));
                 return;
             }
 
@@ -2014,13 +2065,32 @@ void ManagePosition() {
             // Calculate lots to close, normalized to broker step sizes
             double lots_to_close = MathFloor((g_pos_state.initial_volume * InpTP1PartialVol) / step) * step;
 
+            // Calculate BE Price upfront so both execution branches can utilize it
+            double be_price = g_pos_state.is_long ?
+                              (g_pos_state.entry_price + g_pos_state.atr_at_entry * InpBEBufferATR) :
+                              (g_pos_state.entry_price - g_pos_state.atr_at_entry * InpBEBufferATR);
+            be_price = NormalizeDouble(be_price, digits);
+
             if (lots_to_close >= min_lot) {
+                // Attempt Partial Close
                 if (g_trade.PositionClosePartial(g_pos_state.ticket, lots_to_close)) {
-                    g_pos_state.tp1_hit = true; // State is only updated upon broker success
-                    string msg = StringFormat("💰 %s TP1 Hit! Closed %.2f lots to secure profit. SL remains intact.", _Symbol, lots_to_close);
-                    Log(msg);
-                    if (InpEnableAlerts) Alert(msg);
-                    if (InpEnableNotify) SendNotification(msg);
+                    g_pos_state.tp1_hit = true;
+
+                    // Move SL to BE even after successful partial close.
+                    if (ModifyStopLoss(be_price)) {
+                        g_pos_state.be_set = true;
+                        string msg = StringFormat("💰 %s TP1 Hit! Closed %.2f lots. SL moved to BE: %.5f", _Symbol, lots_to_close, be_price);
+                        Log(msg);
+                        if (InpEnableAlerts) Alert(msg);
+                        if (InpEnableNotify) SendNotification(msg);
+                    } else {
+                        // If sync delay prevents immediate BE move, log it and allow TP2 trailing to catch it later.
+                        string msg = StringFormat("💰 %s TP1 Hit! Closed %.2f lots. SL BE move delayed.", _Symbol, lots_to_close);
+                        Log(msg);
+                        if (InpEnableAlerts) Alert(msg);
+                        if (InpEnableNotify) SendNotification(msg);
+                    }
+
                     last_tp1_attempt = 0; // Reset throttle on success
                     g_last_manage_reason = "";
                 } else {
@@ -2028,13 +2098,6 @@ void ManagePosition() {
                     PrintThrottledManageLog(StringFormat("Failed to partially close position at TP1: %d", g_trade.ResultRetcode()));
                 }
             } else {
-                // Initial volume was too small to partial close.
-                // Fall through to immediate BE capital protection instead of abandoning management.
-                double be_price = g_pos_state.is_long ?
-                                  (g_pos_state.entry_price + g_pos_state.atr_at_entry * InpBEBufferATR) :
-                                  (g_pos_state.entry_price - g_pos_state.atr_at_entry * InpBEBufferATR);
-                be_price = NormalizeDouble(be_price, digits);
-
                 if (ModifyStopLoss(be_price)) {
                     g_pos_state.tp1_hit = true;
                     g_pos_state.be_set = true;
@@ -2045,8 +2108,18 @@ void ManagePosition() {
                     last_tp1_attempt = 0;
                     g_last_manage_reason = "";
                 } else {
-                    last_tp1_attempt = current_time;
-                    PrintThrottledManageLog(StringFormat("Failed to move SL to BE at TP1 for micro-lot: %d", g_trade.ResultRetcode()));
+                    // Prevent infinite throttle lock if SL is already at or better than BE
+                    double curr_sl = g_position_info.StopLoss();
+                    bool already_better = g_pos_state.is_long ? (curr_sl >= be_price) : (curr_sl <= be_price);
+
+                    if (already_better) {
+                        g_pos_state.tp1_hit = true;
+                        g_pos_state.be_set = true;
+                        Log("🛡️ TP1 Hit: SL already at or better than BE for micro-lot.", true);
+                    } else {
+                        last_tp1_attempt = current_time;
+                        PrintThrottledManageLog(StringFormat("Failed to move SL to BE at TP1 for micro-lot: %d", g_trade.ResultRetcode()));
+                    }
                 }
             }
         }
@@ -2099,10 +2172,7 @@ void RunMarketAnalysis() {
     // ---- Guard: Session filter ----
     SSessionInfo session = GetSessionInfo();
     if (InpSessionFilter && !session.is_active) {
-        if (g_last_skip_reason != "session") {
-            PrintThrottledSkipReason("Outside trading sessions. Scanning paused.");
-            g_last_skip_reason = "session";
-        }
+        PrintThrottledSkipReason("Outside trading sessions. Scanning paused.");
         return;
     }
 
@@ -2127,10 +2197,7 @@ void RunMarketAnalysis() {
 
     // ---- Guard: Position already open ----
     if (IsPositionOpen()) {
-        if (g_last_skip_reason != "position") {
-            PrintThrottledSkipReason("Position already open. Scanning paused.");
-            g_last_skip_reason = "position";
-        }
+        PrintThrottledSkipReason("Position already open. Scanning paused.");
         return;
     }
 
@@ -2216,6 +2283,7 @@ void RunMarketAnalysis() {
         if (!active_daily || sweep_tier == SWEEP_DAILY) {
             g_recent_sweep_tier = sweep_tier;
             g_recent_sweep_dir = sweep_dir;
+            g_recent_sweep_depth = sweep_depth;
             g_bars_since_sweep = 0;
         } else {
             // We have a fresh major sweep, but we are already tracking a fresh daily sweep.
@@ -2249,21 +2317,9 @@ void RunMarketAnalysis() {
     // ---- Route through strategy engine ----
     SSignal signal = RouteStrategy(rates[1], g_current_atr);
     if (!signal.valid) {
-        PrintThrottledSkipReason("No strategy qualified. Diagnostics -> " + signal.diagnostic);
+        PrintThrottledSkipReason("No strategy qualified. (Diagnostics logging to CSV)");
+        UpdateDiagnosticStats(signal.diagnostic);
         return;
-    }
-
-    // ---- Guard: Directional Asymmetry Filter (Short Trades) ----
-    // Compensate for inherent macro long-bias in volatile assets.
-    // Shorts face a natural headwind and must therefore demonstrate
-    // significantly fresher structural momentum to be validated.
-    if (signal.direction == ZONE_BEAR && InpRequireBOS) {
-        int max_short_bars = (int)MathFloor(InpBOSRecencyBars * 0.5); // Halve the allowed window
-        if (g_bars_since_break > max_short_bars) {
-            PrintThrottledSkipReason(StringFormat("Short rejected: Momentum too stale (%d bars > max %d for shorts).",
-                                     g_bars_since_break, max_short_bars));
-            return;
-        }
     }
 
     // ---- Guard: POI Confluence Filter ----
@@ -2316,7 +2372,6 @@ void RunMarketAnalysis() {
 
     if (executed) {
         g_bars_since_last_signal = 0;
-        g_last_skip_reason = ""; // Reset after a successful trade execution
     }
 }
 
@@ -2382,6 +2437,7 @@ void UpdateStrategyStats(string name, double profit, bool is_long) {
         g_strategy_stats[idx].short_trades++;
         if (profit > 0.5) g_strategy_stats[idx].short_wins++;
     }
+
     g_strategy_stats[idx].net_profit += profit;
 }
 
@@ -2393,8 +2449,10 @@ void ExportStrategyStats() {
 
     if (handle != INVALID_HANDLE) {
         FileWrite(handle, "Strategy", "Total", "Longs", "Long Win%", "Shorts", "Short Win%", "Net Profit");
+
+        // ---- Pass 1: Statistically Significant Strategies (>= 20 Trades) ----
         for (int i = 0; i < g_stats_count; i++) {
-            double win_rate = 0.0;
+            if (g_strategy_stats[i].total_trades < 20) continue; // Skip low samples
 
             double long_wr = 0.0, short_wr = 0.0;
 
@@ -2412,6 +2470,31 @@ void ExportStrategyStats() {
                               NormalizeDouble(short_wr, 2),
                               NormalizeDouble(g_strategy_stats[i].net_profit, 2));
         }
+
+        FileWrite(handle, ""); // Blank line for readability
+        FileWrite(handle, "--- INSUFFICIENT DATA (< 20 TRADES) ---", "", "", "", "", "", "");
+
+        // ---- Pass 2: Statistically Insignificant Strategies (< 20 Trades) ----
+        for (int i = 0; i < g_stats_count; i++) {
+            if (g_strategy_stats[i].total_trades >= 20) continue; // Skip high samples
+
+            double long_wr = 0.0, short_wr = 0.0;
+
+            if (g_strategy_stats[i].long_trades > 0)
+                long_wr = ((double)g_strategy_stats[i].long_wins / g_strategy_stats[i].long_trades) * 100.0;
+
+            if (g_strategy_stats[i].short_trades > 0)
+                short_wr = ((double)g_strategy_stats[i].short_wins / g_strategy_stats[i].short_trades) * 100.0;
+
+            FileWrite(handle, g_strategy_stats[i].strategy_name,
+                              g_strategy_stats[i].total_trades,
+                              g_strategy_stats[i].long_trades,
+                              NormalizeDouble(long_wr, 2),
+                              g_strategy_stats[i].short_trades,
+                              NormalizeDouble(short_wr, 2),
+                              NormalizeDouble(g_strategy_stats[i].net_profit, 2));
+        }
+
         FileClose(handle);
         Log("Strategy stats exported to: " + filename);
     } else {
@@ -2419,9 +2502,65 @@ void ExportStrategyStats() {
     }
 }
 
+/// @brief Updates the diagnostic tally for skipped signals.
+/// @param aggregated_diagnostic Piped string of diagnostic reasons (e.g., "LiqSweep: [...] | OTE: [...]").
+void UpdateDiagnosticStats(string aggregated_diagnostic) {
+    if (aggregated_diagnostic == "") return;
+
+    string reasons[];
+    // Split the piped string ("LiqSweep: [...] | OTE: [...]") into an array
+    int num_reasons = StringSplit(aggregated_diagnostic, (ushort)'|', reasons);
+
+    for (int i = 0; i < num_reasons; i++) {
+        string r = reasons[i];
+        StringTrimLeft(r);
+        StringTrimRight(r);
+        if (r == "") continue;
+
+        // Find existing reason or create a new entry
+        int idx = -1;
+        for (int j = 0; j < g_diag_count; j++) {
+            if (g_diag_stats[j].reason == r) {
+                idx = j;
+                break;
+            }
+        }
+
+        if (idx == -1) {
+            if (g_diag_count >= 100) continue; // Prevent bounds overflow
+            idx = g_diag_count;
+            g_diag_stats[idx].reason = r;
+            g_diag_stats[idx].count = 0;
+            g_diag_count++;
+        }
+
+        g_diag_stats[idx].count++;
+    }
+}
+
+/// @brief Exports the diagnostic tallies to a CSV file.
+void ExportDiagnosticStats() {
+    if (g_diag_count == 0) return;
+
+    string filename = StringFormat("Nexubot_Diagnostics_%s.csv", _Symbol);
+    int handle = FileOpen(filename, FILE_CSV | FILE_WRITE | FILE_ANSI, ',');
+
+    if (handle != INVALID_HANDLE) {
+        FileWrite(handle, "Diagnostic Reason", "Count");
+        for (int i = 0; i < g_diag_count; i++) {
+            FileWrite(handle, g_diag_stats[i].reason, g_diag_stats[i].count);
+        }
+        FileClose(handle);
+        Log("Diagnostic stats exported to: " + filename);
+    } else {
+        Log("Failed to export diagnostic stats. Error: " + IntegerToString(GetLastError()), true);
+    }
+}
+
 //==========================================================================
 //  SECTION 18: EA EVENT HANDLERS
 //==========================================================================
+
 /// @brief Initializes all indicator handles, configures the trade engine,
 /// and warms up the POI state from historical data.
 /// @return INIT_SUCCEEDED or INIT_FAILED.
@@ -2520,7 +2659,7 @@ int OnInit() {
     }
 
     Log(StringFormat("Nexubot initialized. HTF Trend: %.1f | ATR: %.5f | PDH: %.5f | PDL: %.5f",
-              g_htf_trend, g_current_atr, g_pdh, g_pdl));
+                      g_htf_trend, g_current_atr, g_pdh, g_pdl));
 
     return INIT_SUCCEEDED;
 }
@@ -2534,6 +2673,7 @@ void OnDeinit(const int reason) {
     if (g_h_ema200_h1 != INVALID_HANDLE) IndicatorRelease(g_h_ema200_h1);
 
     ExportStrategyStats();
+    ExportDiagnosticStats();
 
     Log(StringFormat("Nexubot deinitialized. Reason: %d", reason));
 }
@@ -2543,7 +2683,7 @@ void OnDeinit(const int reason) {
 /// 1. Position management (every tick — for TP1/TP2 detection precision)
 /// 2. New bar detection — runs full market analysis on confirmed M5 bar close
 void OnTick() {
-    // ---- 1. Manage open position on EVERY tick (highest priority) ----
+    // ---- 1. Manage open position on EVERY tick ----
     // This ensures we don't miss a TP1/TP2 level hit mid-bar
     if (g_pos_state.active) {
         ManagePosition();
