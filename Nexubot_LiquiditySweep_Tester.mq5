@@ -59,8 +59,8 @@ input int             InpMaxSpreadPoints    = 1000;    // Max allowed spread in 
 input group           "==== ATR & VOLATILITY ===="
 input int             InpATRPeriod          = 14;     // ATR calculation period
 input int             InpATREMAPeriod       = 48;     // ATR EMA period (expansion baseline)
-input double          InpMinVolExpansion    = 0.8;   // Optimal ATR expansion ratio (full risk)
-input double          InpMinVolFloor        = 0.8;   // Absolute minimum expansion ratio (scaled risk floor)
+input double          InpMinVolExpansion    = 0.7;   // Optimal ATR expansion ratio (full risk)
+input double          InpMinVolFloor        = 0.7;   // Absolute minimum expansion ratio (scaled risk floor)
 input double          InpSLMultiplierBase   = 1.0;    // Base SL ATR multiplier
 input double          InpSLMultiplierHVol   = 1.4;    // SL ATR multiplier for volatile assets
 input double          InpMaxSLCapATR        = 2.0;    // Max SL cap (x ATR) — hard ceiling
@@ -74,7 +74,7 @@ input int             InpStructureLookback  = 200;    // Structure detection dep
 input int             InpMajorSwingPeriod   = 50;     // Major swing lookback (bars)
 input int             InpSweepRecencyBars   = 48;     // Max bars since a Tier2+ sweep to remain "active"
 input int             InpBOSRecencyBars     = 12;     // Max bars since a BOS/CHoCH to remain "active"
-input int             InpSignalCooldownBars = 3;      // Min bars to wait after a trade before a new entry
+input int             InpSignalCooldownBars = 1;      // Min bars to wait after a trade before a new entry
 
 //--- Session Times  (Adjust to your broker's server timezone offset)
 input group           "==== SESSION TIMES (SERVER TIME) ===="
